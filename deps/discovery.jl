@@ -165,6 +165,7 @@ const cuda_library_versions = Dict(
         "cufft"     => v"10.1.3", #.191
         "curand"    => v"10.2.0", #.191
         "cusolver"  => v"10.4.0", #.191
+        "cusolverMg"=> v"10.4.0", #.191
         "cusparse"  => v"11.0.0", #.191
         "npp"       => v"11.0.0", #.191
         "nvjpeg"    => v"11.0.0", #.191

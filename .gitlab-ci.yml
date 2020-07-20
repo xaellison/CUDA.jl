@@ -138,6 +138,18 @@ cuda:none:
 
 # special tests
 
+multigpu:
+  extends:
+    - .julia:1.4
+    - .test
+  tags:
+    - nvidia
+    - cuda_10.2
+    - multigpu
+  variables:
+    JULIA_CUDA_USE_BINARYBUILDER: 'true'
+    JULIA_CUDA_TEST_ARGS: '--gpus=2 cusolver/cusolvermg'
+
 pool:none:
   extends:
     - .julia:1.4

@@ -46,6 +46,7 @@ const __libcudnn = Ref{Union{Nothing,String}}(nothing)
 const __libcutensor = Ref{Union{Nothing,String}}(nothing)
 const __libcublasmg = Ref{Union{Nothing,String}}(nothing)
 const __libcudalibmg = Ref{Union{Nothing,String}}(nothing)
+const __libcusolverMg = Ref{Union{Nothing,String}}(nothing)
 
 nvdisasm() = @after_init(__nvdisasm[])
 libdevice() = @after_init(__libdevice[])
@@ -65,14 +66,14 @@ end
 
 export has_cupti, has_nvtx
 has_cupti() = @after_init(__libcupti[]) !== nothing
-has_nvtx() = @after_init(__libnvtx[]) !== nothing
+has_nvtx()  = @after_init(__libnvtx[]) !== nothing
 
-libcudart() = @after_init(__libcudart[])
-libcublas() = @after_init(__libcublas[])
+libcudart()   = @after_init(__libcudart[])
+libcublas()   = @after_init(__libcublas[])
 libcusparse() = @after_init(__libcusparse[])
 libcusolver() = @after_init(__libcusolver[])
-libcufft() = @after_init(__libcufft[])
-libcurand() = @after_init(__libcurand[])
+libcufft()    = @after_init(__libcufft[])
+libcurand()   = @after_init(__libcurand[])
 function libcudnn()
     @after_init begin
         @assert has_cudnn() "This functionality is unavailabe as CUDNN is missing."
@@ -91,6 +92,12 @@ function libcublasmg()
         __libcublasmg[]
     end
 end
+function libcusolvermg()
+    @after_init begin
+        @assert has_cusolvermg() "This functionality is unavailabe as CUSOLVERMG is missing."
+        __libcusolverMg[]
+    end
+end
 function libcudalibmg()
     @after_init begin
         @assert has_cudalibmg() "This functionality is unavailabe as CUDALIBMG is missing."
@@ -98,10 +105,11 @@ function libcudalibmg()
     end
 end
 
-export has_cudnn, has_cutensor, has_cublasmg, has_cudalibmg
+export has_cudnn, has_cutensor, has_cublasmg, has_cudalibmg, has_cusolvermg
 has_cudnn() = @after_init(__libcudnn[]) !== nothing
 has_cutensor() = @after_init(__libcutensor[]) !== nothing
 has_cublasmg() = @after_init(__libcublasmg[]) !== nothing
+has_cusolvermg() = @after_init(__libcusolverMg[]) !== nothing
 has_cudalibmg() = @after_init(__libcudalibmg[]) !== nothing
 
 
@@ -184,8 +192,13 @@ function use_artifact_cuda()
     @assert isfile(__libcudadevrt[])
     __libdevice[] = artifact_file(artifact.dir, joinpath("share", "libdevice", "libdevice.10.bc"))
     @assert isfile(__libdevice[])
-
-    for library in ("cublas", "cusparse", "cusolver", "cufft", "curand")
+    
+    if CUDA.toolkit_version() >= v"10.1"
+        lib_list =  ("cublas", "cusparse", "cusolver", "cufft", "curand", "cudart", "cusolverMg")
+    else
+        lib_list =  ("cublas", "cusparse", "cusolver", "cufft", "curand", "cudart")
+    end
+    for library in lib_list 
         handle = getfield(CUDA, Symbol("__lib$library"))
 
         handle[] = artifact_cuda_library(artifact.dir, library, artifact.release)
@@ -234,7 +247,6 @@ function use_local_cuda()
 
     for library in ("cublas", "cusparse", "cusolver", "cufft", "curand")
         handle = getfield(CUDA, Symbol("__lib$library"))
-
         path = find_cuda_library(library, cuda_dirs, cuda_version)
         if path === nothing
             @debug "Could not find $library"
@@ -318,12 +330,14 @@ end
 # CUBLASMG
 function use_local_cublasmg(cuda_dirs)
     cdirs = copy(cuda_dirs)
-    let ldpath = ENV["LD_LIBRARY_PATH"]
-        dirs = split(ldpath, Sys.iswindows() ? ';' : ':')
-        filter!(ldpath->!isempty(ldpath), dirs)
-        append!(cdirs, dirs)
+    if haskey(ENV, "LD_LIBRARY_PATH")
+        let ldpath = ENV["LD_LIBRARY_PATH"]
+            dirs = split(ldpath, Sys.iswindows() ? ';' : ':')
+            filter!(ldpath->!isempty(ldpath), dirs)
+            append!(cdirs, dirs)
+        end
     end
-    path = find_library(["cublasMg"]; locations=cdirs)
+    path = find_library("cublasMg"; locations=cdirs)
     path === nothing && return false
 
     __libcublasmg[] = path
@@ -333,12 +347,14 @@ end
 
 function use_local_cudalibmg(cuda_dirs)
     cdirs = copy(cuda_dirs)
-    let ldpath = ENV["LD_LIBRARY_PATH"]
-        dirs = split(ldpath, Sys.iswindows() ? ';' : ':')
-        filter!(ldpath->!isempty(ldpath), dirs)
-        append!(cdirs, dirs)
+    if haskey(ENV, "LD_LIBRARY_PATH")
+        let ldpath = ENV["LD_LIBRARY_PATH"]
+            dirs = split(ldpath, Sys.iswindows() ? ';' : ':')
+            filter!(ldpath->!isempty(ldpath), dirs)
+            append!(cdirs, dirs)
+        end
     end
-    path = find_library(["cudalibmg"]; locations=cdirs)
+    path = find_library("cudalibmg"; locations=cdirs)
     path === nothing && return false
 
     __libcudalibmg[] = path
