@@ -9,8 +9,9 @@ m = 8192
 n = div(8192, 2)
 k = 8192*2
 devs = voltas[1:4]
-synchronize()
 CUBLASMG.cublasMgDeviceSelect(CUBLASMG.mg_handle(), length(devs), devs)
+drs = length(devs) == 4 ? 2 : 1
+dcs = length(devs) == 4 ? 2 : 1
 @testset "element type $elty" for elty in [Float32, Float64]
     alpha = convert(elty,1.1)
     beta  = convert(elty,0.0)
@@ -20,7 +21,7 @@ CUBLASMG.cublasMgDeviceSelect(CUBLASMG.mg_handle(), length(devs), devs)
         B = rand(elty, k, n)
         h_C = alpha*A*B + beta*C
         d_C = copy(C)
-        d_C = CUBLASMG.mg_gemm_gpu!('N','N',alpha,A,B,beta,d_C, devs=devs, dev_rows=2, dev_cols=2)
+        d_C = CUBLASMG.mg_gemm_gpu!('N','N',alpha,A,B,beta,d_C, devs=devs, dev_rows=drs, dev_cols=dcs)
         @test d_C ≈ h_C
 
         C = zeros(elty, m, n)
@@ -28,7 +29,7 @@ CUBLASMG.cublasMgDeviceSelect(CUBLASMG.mg_handle(), length(devs), devs)
         B = rand(elty, k, n)
         h_C = alpha*transpose(A)*B + beta*C
         d_C = copy(C)
-        d_C = CUBLASMG.mg_gemm_gpu!('T','N',alpha,A,B,beta,d_C, devs=devs, dev_rows=2, dev_cols=2)
+        d_C = CUBLASMG.mg_gemm_gpu!('T','N',alpha,A,B,beta,d_C, devs=devs, dev_rows=drs, dev_cols=dcs)
         @test d_C ≈ h_C
 
         C = zeros(elty, m, n)
