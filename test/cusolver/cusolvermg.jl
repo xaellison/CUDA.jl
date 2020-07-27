@@ -9,6 +9,7 @@ import LinearAlgebra: BlasInt
 m = 256
 n = 512
 devs = collect(devices())
+devs = vcat(devs, copy(devs))
 
 if CUDA.has_cusolvermg()
     CUSOLVER.cusolverMgDeviceSelect(CUSOLVER.mg_handle(), length(devs), devs)
@@ -49,26 +50,25 @@ if CUDA.has_cusolvermg()
             end
         end # elty
 
-        # sometimes broken for F32???
         @testset "mg_potrf and mg_potri!" begin
-            @testset "element type $elty" for elty in [Float64, ComplexF64]#[Float32, Float64, ComplexF32, ComplexF64]
+            @testset "element type $elty" for elty in [Float32, Float64, ComplexF32, ComplexF64]
                 GC.enable(false)
                 A = rand(elty, m, m)
                 A = A*A'
+                #A = CUSOLVER.mg_potrf!('L',A, devs=devs)
+                LinearAlgebra.LAPACK.potrf!('L', A)
                 hA = copy(A)
-                A = CUSOLVER.mg_potrf!('L',A, devs=devs)
-                A = CUSOLVER.mg_potri!('L',A, devs=devs)
-                LinearAlgebra.LAPACK.potrf!('L', hA)
                 LinearAlgebra.LAPACK.potri!('L', hA)
+                A = CUSOLVER.mg_potri!('L',A, devs=devs)
                 # compare
-                @test A ≈ hA rtol=1e-1 
+                @test tril(A) ≈ tril(hA)
                 GC.enable(true)
             end
         end # elty
 
-        # sometimes broken for F32???
+        # Float32 sometimes broken?
         @testset "mg_potrf and mg_potrs!" begin
-            @testset "element type $elty" for elty in [Float64, ComplexF64]#[Float32, Float64, ComplexF32, ComplexF64]
+            @testset "element type $elty" for elty in [Float64, ComplexF32, ComplexF64]
                 GC.enable(false)
                 A = rand(elty, m, m)
                 B = rand(elty, m, m)
@@ -80,8 +80,9 @@ if CUDA.has_cusolvermg()
                 A = CUSOLVER.mg_potrf!('L',A, devs=devs)
                 B = CUSOLVER.mg_potrs!('L',A,B, devs=devs)
                 # compare
+                tol    = real(elty) == Float32 ? 1e-1 : 1e-6
                 @test A ≈ hA 
-                @test B ≈ hB rtol=1e-6
+                @test B ≈ hB rtol=tol
                 GC.enable(true)
             end
         end # elty
@@ -104,12 +105,12 @@ if CUDA.has_cusolvermg()
                 GC.enable(false)
                 A      = rand(elty,m,m)
                 h_A    = copy(A)
-                A,ipiv = CUSOLVER.mg_getrf!(A, devs=devs)
+                alu    = lu(A, Val(false))
                 B      = rand(elty, m, div(m,2))
                 h_B    = copy(B)
-                B      = CUSOLVER.mg_getrs!('N', A, ipiv, B, devs=devs)
-                alu    = LinearAlgebra.LU(A, convert(Vector{BlasInt},ipiv), zero(BlasInt))
-                @test B ≈ h_A\h_B 
+                tol    = real(elty) == Float32 ? 1e-1 : 1e-6
+                B      = CUSOLVER.mg_getrs!('N', alu.factors, alu.ipiv, B, devs=devs)
+                @test B ≈ h_A\h_B  rtol=tol
                 GC.enable(true)
             end
         end

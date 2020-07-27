@@ -245,7 +245,7 @@ function use_local_cuda()
         __libdevice[] = path
     end
 
-    for library in ("cublas", "cusparse", "cusolver", "cufft", "curand")
+    for library in ("cublas", "cusparse", "cusolver", "cufft", "curand", "cusolverMg")
         handle = getfield(CUDA, Symbol("__lib$library"))
         path = find_cuda_library(library, cuda_dirs, cuda_version)
         if path === nothing

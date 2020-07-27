@@ -1099,7 +1099,7 @@ function mg_potrf!(uplo::Char, A; devs=[0], dev_rows=1, dev_cols=length(devs)) #
     A_ref_arr     = allocateBuffers(dev_rows, dev_cols, ndevs, devs, descRef[], A)
     IA      = 1 # for now
     JA      = 1
-    cusolverMgPotrf_bufferSize(mg_handle(), cuuplo, N, A_ref_arr, IA, JA, descRef[], cudaDataType(eltype(A)), lwork)
+    cusolverMgPotrf_bufferSize(mg_handle(), cuuplo, n, A_ref_arr, IA, JA, descRef[], cudaDataType(eltype(A)), lwork)
     for (di, dev) in enumerate(devs)
         device!(dev)
         workspace[di]     = CUDA.zeros(eltype(A), lwork[])
@@ -1124,7 +1124,7 @@ function mg_potri!(uplo::Char, A; devs=[0], dev_rows=1, dev_cols=length(devs)) #
     end
     cuuplo  = cublasfill(uplo)
     m, n    = size(A)
-    N       = div(size(A, 2), length(devices())) # dimension of the sub-matrix
+    N       = div(size(A, 2), ndevs) # dimension of the sub-matrix
     descRef = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     workspace     = Vector{CuArray}(undef, ndevs)
@@ -1133,7 +1133,7 @@ function mg_potri!(uplo::Char, A; devs=[0], dev_rows=1, dev_cols=length(devs)) #
     A_ref_arr     = allocateBuffers(dev_rows, dev_cols, ndevs, devs, descRef[], A)
     IA      = 1 # for now
     JA      = 1
-    cusolverMgPotri_bufferSize(mg_handle(), cuuplo, N, A_ref_arr, IA, JA, descRef[], cudaDataType(eltype(A)), lwork)
+    cusolverMgPotri_bufferSize(mg_handle(), cuuplo, n, A_ref_arr, IA, JA, descRef[], cudaDataType(eltype(A)), lwork)
     for (di, dev) in enumerate(devs)
         device!(dev)
         workspace[di]     = CUDA.zeros(eltype(A), lwork[])
@@ -1159,8 +1159,8 @@ function mg_potrs!(uplo::Char, A, B; devs=[0], dev_rows=1, dev_cols=length(devs)
     cuuplo   = cublasfill(uplo)
     ma, na   = size(A)
     mb, nb   = size(A)
-    NA       = div(size(A, 2), length(devices())) # dimension of the sub-matrix
-    NB       = div(size(B, 2), length(devices())) # dimension of the sub-matrix
+    NA       = div(size(A, 2), ndevs) # dimension of the sub-matrix
+    NB       = div(size(B, 2), ndevs) # dimension of the sub-matrix
     descRefA = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     descRefB = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
@@ -1174,7 +1174,7 @@ function mg_potrs!(uplo::Char, A, B; devs=[0], dev_rows=1, dev_cols=length(devs)
     JA      = 1
     IB      = 1 # for now
     JB      = 1
-    cusolverMgPotrs_bufferSize(mg_handle(), cuuplo, NA, NB, A_ref_arr, IA, JA, descRefA[], B_ref_arr, IB, JB, descRefB[], cudaDataType(eltype(A)), lwork)
+    cusolverMgPotrs_bufferSize(mg_handle(), cuuplo, na, nb, A_ref_arr, IA, JA, descRefA[], B_ref_arr, IB, JB, descRefB[], cudaDataType(eltype(A)), lwork)
     for (di, dev) in enumerate(devs)
         device!(dev)
         workspace[di]     = CUDA.zeros(eltype(A), lwork[])
@@ -1259,7 +1259,7 @@ function mg_getrs!(trans, A, ipiv, B; devs=[0], dev_rows=1, dev_cols=length(devs
     JA      = 1
     IB      = 1 # for now
     JB      = 1
-    for (di, dev) in enumerate(devices())
+    for (di, dev) in enumerate(devs)
         device!(dev)
         local_ipiv    = Cint.(ipiv[(di-1)*NA+1:min(di*NA,length(ipiv))])
         ipivs[di]     = CuArray(local_ipiv)
