@@ -9,7 +9,9 @@ import LinearAlgebra: BlasInt
 m = 256
 n = 512
 devs = collect(devices())
-devs = vcat(devs, copy(devs))
+if length(devs) == 1
+    devs = vcat(devs, copy(devs))
+end
 
 if CUDA.has_cusolvermg()
     CUSOLVER.cusolverMgDeviceSelect(CUSOLVER.mg_handle(), length(devs), devs)
