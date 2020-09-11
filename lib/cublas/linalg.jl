@@ -47,10 +47,21 @@ function LinearAlgebra.axpy!(alpha::Number, x::CuArray{T}, y::CuArray{T}) where 
 end
 
 function LinearAlgebra.axpby!(alpha::Number, x::CuArray{T}, beta::Number, y::CuArray{T}) where T<:CublasFloat
-    length(x)==length(y) || throw(DimensionMismatch("axpy arguments have lengths $(length(x)) and $(length(y))"))
+    length(x)==length(y) || throw(DimensionMismatch("axpby arguments have lengths $(length(x)) and $(length(y))"))
     axpby!(length(x), alpha, x, 1, beta, y, 1)
 end
 
+function LinearAlgebra.rotate!(x::CuArray{T}, y::CuArray{T}, c::T, s::T) where T<:Union{Float32,Float64}
+    length(x)==length(y) || throw(DimensionMismatch("rotate arguments have lengths $(length(x)) and $(length(y))"))
+    param = CuArray([-one(T), c, s, -s, c])
+    rotm(length(x), x, 1, y, 1, param)
+end
+
+function LinearAlgebra.reflect!(x::CuArray{T}, y::CuArray{T}, c::T, s::T) where T<:Union{Float32,Float64}
+    length(x)==length(y) || throw(DimensionMismatch("reflect arguments have lengths $(length(x)) and $(length(y))"))
+    param = CuArray([-one(T), c, s, s, -c])
+    rotm(length(x), x, 1, y, 1, param)
+end
 
 #
 # BLAS 2

@@ -205,6 +205,22 @@ for (fname, elty) in ((:cublasDaxpy_v2,:Float64),
     end
 end
 
+## rotm
+for (fname, elty) in ((:cublasDrotm_v2,:Float64),
+                      (:cublasSrotm_v2,:Float32))
+    @eval begin
+        function rotm(n::Integer,
+                      x::CuArray{$elty},
+                      incx::Integer,
+                      y::CuArray{$elty},
+                      incy::Integer,
+                      param::CuArray{$elty})
+            $fname(handle(), n, x, incx, y, incy, param)
+            x, y
+        end
+    end
+end
+
 function axpy!(alpha::Number,
                x::CuArray{T},
                rx::Union{UnitRange{<:Integer},AbstractRange{<:Integer}},
