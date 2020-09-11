@@ -52,8 +52,8 @@ Base.eps(::Type{BFloat16}) = Base.bitcast(BFloat16, 0x3c00)
         if T <: Real
             x = rand(T, m)
             y = rand(T, m)
-            c = rand()
-            s = rand()
+            c = rand(T)
+            s = rand(T)
 
             dx = CuArray(x)
             dy = CuArray(y)
