@@ -95,4 +95,7 @@ include("deprecated.jl")
 include("precompile.jl")
 _precompile_()
 
+include("sorting.jl")
+export quicksort!
+
 end
