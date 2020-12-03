@@ -2,37 +2,26 @@
 Quicksort!
 Alex Ellison
 @xaellison
-
 Usage:
 quicksort!(my_cuarray)
-
 The main quicksort kernel uses dynamic parallelism. Let's call blocksize M. The
 first part of the kernel bubble sorts M elements with maximal stride between
 lo and hi. If the sublist is <= M elements, stride = 1 and no recursion
-happens. Otherwise, we pick element lo + M / 2 * stride as a pivot. This is
+happens. Otherwise, we pick element lo + M ÷ 2 * stride as a pivot. This is
 an efficient choice for random lists and pre-sorted lists.
 
 Partition is done in stages:
-1. In a separate kernel: Merge-sort batches of M values using their comparison
-    to pivot as a key. The comparison alternates between < and <= with recursion
-    depth. This makes no difference when there are many unique values, but when
-    there are many duplicates, this effectively partitions into <, =, and >.
+1. Merge-sort batches of M values using their comparison to pivot as a key. The
+   comparison alternates between < and <= with recursion depth. This makes no
+   difference when there are many unique values, but when there are many
+   duplicates, this effectively partitions into <, =, and >.
 2. Consolidate batches. This runs inside the quicksort kernel.
 
-Information about the partitions of each batch is stored in shared memory if
-there are fewer than N batches (list length <= M ^ 2). Otherwise, it is stored in
-a global array. Any sub-kernels which also need that array will be executed
-synchronously so they don't conflict over that memory.
-
-Naming conventions:
-Sublists (ranges of the list being sorted) are denoted by `my_floor` and one of
-    `L` and `my_ceil`. `my_floor` is an exclusive lower bound, `my_ceil` is an
+Sublists (ranges of the list being sorted) are denoted by `lo` and one of
+    `L` and `hi`. `lo` is an exclusive lower bound, `hi` is an
     inclusive upperboard, `L` is their difference.
-
-`lo` / `hi` are used in place of `my_floor` / `my_ceil` in `qsort_kernel`
-    `lo` / `hi` are indices of  batches in `consolidate_batch_partition`
-
-`b_sums` is "batch sums", the number of values in a batch which are >= pivot
+`b_sums` is "batch sums", the number of values in a batch which are >= pivot or
+    > pivot depending on the relevant `parity`
 """
 
 #-------------------------------------------------------------------------------
@@ -45,16 +34,8 @@ function ceil_div(a, b)
 end
 
 """
-Returns smallest power of 2 >= x
+Returns smallest power of 2 < x
 """
-function pow2_ceil(x)
-    out = 1
-    while out < x
-        out *= 2
-    end
-    out
-end
-
 function pow2_floor(x)
     out = 1
     while out * 2 <= x
@@ -78,7 +59,7 @@ function batch_ceil(idx, n)
 end
 
 """
-GPU friendly step function (step at i = 1)
+GPU friendly step function (step at `i` = 1)
 """
 function Θ(i)
     return 1 & (1 <= i)
@@ -131,76 +112,61 @@ function merge_swap_shmem(value, idx, n, sums, swap)
     end
 end
 
-@inline function batch_partition(values, swap, pivot, sums, i, idx0, my_floor, L, N_t, parity)
-    if idx0 - my_floor <= L
-        @inbounds swap[i] = values[idx0]
-        @inbounds sums[i] = 1 & flex_lt(swap[i], pivot, parity)
+"""
+Partition the region of `values` after index `lo` up to (inclusive) `hi` with
+respect to `pivot`. This is done by a 'binary' merge sort, where each the values
+are sorted by a boolean key: how they compare to `pivot`. The comparison is
+affected by `parity`. See `flex_lt`. `swap` is an array for exchanging values
+and `sums` is an array of Int32s used during the merge sort.
+
+Uses block index to decide which values to operate on.
+"""
+@inline function batch_partition(values, pivot, swap, sums, lo, hi, parity)
+    sync_threads()
+    idx0 = Int(lo) + (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx0 <= hi
+         swap[threadIdx().x] = values[idx0]
+         sums[threadIdx().x] = 1 & flex_lt(swap[threadIdx().x], pivot, parity)
     else
-        @inbounds sums[i] = 1
+        @inbounds sums[threadIdx().x] = 1
     end
     sync_threads()
-    val = merge_swap_shmem(swap[i], i, 1, sums, swap)
+    val = merge_swap_shmem(swap[threadIdx().x], threadIdx().x, 1, sums, swap)
     temp = 2
-    while temp < N_t
-        val = merge_swap_shmem(val, i, temp, sums, swap)
+    while temp < blockDim().x
+        val = merge_swap_shmem(val, threadIdx().x, temp, sums, swap)
         temp *= 2
     end
     sync_threads()
 
-    if idx0 - my_floor <= L
-        @inbounds values[idx0] = val
+    if idx0 <= hi
+         values[idx0] = val
     end
+    sync_threads()
 end
 
 """
-Partition `values` such that all < `pivot` come first, then all >= `pivot`.
-NOTE: It is very important that this is a stable sort. We effectively allow
-    unallocated memory to be our null values, and set them to true, at the top
-    of the list. That way, they can be operated on, but at the end they aren't
-    transferred out to global mem.
+Each block evaluates `batch_partition` on consecutive regions of length blockDim().x
+from `lo` to `hi` of `values`.
 """
-function partition_batches_kernel(values :: CuDeviceArray{T}, pivot, my_floor, L, parity :: Val{P}) where {T, P}
-    N_t = blockDim().x
-    i = threadIdx().x
-    idx0 = my_floor + (blockIdx().x - 1) * blockDim().x + i # for addressing
-    swap = @cuDynamicSharedMem(T, N_t, 4 * N_t)
-    sums = @cuDynamicSharedMem(Int32, N_t)
-    batch_partition(values, swap, pivot, sums, i, idx0, my_floor, L, N_t, P)
+function partition_batches_kernel(values :: CuDeviceArray{T}, pivot, lo, hi, parity :: Val{P}) where {T, P}
+    swap = @cuDynamicSharedMem(T, blockDim().x, 4 * blockDim().x)
+    sums = @cuDynamicSharedMem(Int32, blockDim().x)
+    batch_partition(values, pivot, swap, sums, lo, hi, P)
     return nothing
 end
-
-"""
-Partition `values` such that all < `pivot` come first, then all >= `pivot`.
-Method stores the number of values >= `pivot` in each batch in `batch_sums`
-"""
-function partition_batches_kernel(values :: CuDeviceArray{T}, pivot, batch_sums, my_floor, L, parity :: Val{P}) where {T, P}
-    N_t = blockDim().x
-    i = threadIdx().x
-    idx0 = my_floor + (blockIdx().x - 1) * blockDim().x + i # for addressing
-    swap = @cuDynamicSharedMem(T, N_t, 4 * N_t)
-    sums = @cuDynamicSharedMem(Int32, N_t)
-    batch_partition(values, swap, pivot, sums, i, idx0, my_floor, L, N_t, P)
-
-    if i == 1
-        # this is the amount by which our kernel "overhangs" the real list
-        # and how many unnecessary trues are included in the sum
-        overhang = (idx0 - my_floor <= (L - L % N_t) || L % N_t == 0 ? 0 : N_t - (L % N_t))
-        @inbounds batch_sums[blockIdx().x] = sums[i] - overhang
-    end
-    return nothing
-end
-
 
 #-------------------------------------------------------------------------------
 # Batch consolidation
 """
-Finds the index in `array` of the last value less than `pivot`.
-Searches after index `my_floor` up to (inclusive) index `my_ceil`
+Finds the index in `array` of the last value <= `pivot` if `parity` = true or the
+last value < `pivot` if `parity` = false.
+Searches after index `lo` up to (inclusive) index `hi`
 """
-function seek_last_less_than(array, pivot, my_floor, my_ceil, parity) :: Int32
-    low = my_floor + 1
-    high = my_ceil
-    while low <= high
+function seek_last_less_than(array, pivot, lo, hi, parity :: Bool) :: Int32
+    low = lo + 1
+    high = hi
+    @inbounds while low <= high
         mid = (low + high) ÷ 2
         if flex_lt(array[mid], pivot, parity)
             high = mid - 1
@@ -212,168 +178,213 @@ function seek_last_less_than(array, pivot, my_floor, my_ceil, parity) :: Int32
 end
 
 """
-Performs binary search on batches to find their partitions. Stores result in
-`b_sums`
-"""
-@inline function init_bsums(vals, pivot, my_floor, L, N_t, N_b, i, b_sums, parity)
-    if i <= N_b
-        seek_lo = my_floor + (i - 1) * N_t
-        seek_hi = my_floor + min(Int32(L), Int32(i * N_t))
-        b_sums[i] = seek_hi - seek_last_less_than(vals, pivot, seek_lo, seek_hi, parity)
-    end
-    sync_threads()
-end
+This assumes the region of `vals` of length `L` starting after `lo`
+has been batch partitioned with respect to `pivot`. Further, it assumes that
+these batches are of size `blockDim().x`.
 
+Using 1 step per batch, consolidate these partitioned batches such that the
+region is fully partitioned. Each step moves at most `blockDim().x` values.
+
+`b_sums`: either shared memory or a global array which serves as scratch space
+for storing the partition of each batch.
+
+`parity`: see top docstring
+
+Must only run on 1 SM.
 """
-In linear time, merge `N_b` consecutive, partitioned batches so that the
-`L` length region of `vals` after `lo` is partitioned. Must only run on 1 SM.
-`i` - thread id
-`b_sums` - number of values >= `pivot` in each batch
-"""
-@inline function consolidate_batch_partition(vals, pivot, my_floor, L, N_t, N_b, i, b_sums)
-    i = threadIdx().x
+@inline function consolidate_batch_partition(vals :: AbstractArray{T}, pivot, lo, L, b_sums, parity :: Bool) where T
     sync_threads()
-    b = b_sums[1]
-    a = N_t - b
-    sync_threads()
-    for hi in 2:N_b
-        n_eff =  (hi != N_b || L % N_t == 0) ? N_t : L % N_t
+    @inline N_b() = ceil(Int, L / blockDim().x)
+    @inline batch(k) :: Int32 = threadIdx().x + k * blockDim().x
+
+    my_iter = 0
+    a = 0
+    b = 0
+    swap = zero(T)
+
+    @inbounds for batch_i in 1:N_b()
+        if batch_i % blockDim().x == 1
+            if batch(my_iter) <= N_b()
+                seek_lo = lo + (batch(my_iter) - 1) * blockDim().x
+                seek_hi = lo + min(Int32(L), Int32(batch(my_iter) * blockDim().x))
+                b_sums[threadIdx().x] = seek_hi - seek_last_less_than(vals, pivot, seek_lo, seek_hi, parity)
+            end
+            my_iter += 1
+        end
+
+        n_eff() = (batch_i != ceil(Int, L / blockDim().x) || L % blockDim().x == 0) ? blockDim().x : L % blockDim().x
         sync_threads()
-        d = b_sums[hi]
-        c = n_eff - d
+        d = b_sums[batch_i - (my_iter - 1) * blockDim().x]
+        c = n_eff() - d
         to_move = min(b, c)
         sync_threads()
-        if i <= n_eff && i <= to_move
-            swap = vals[my_floor + a + i]
+        if threadIdx().x <= to_move
+            swap = vals[lo + a + threadIdx().x]
         end
         sync_threads()
-        if i <= n_eff && i <= to_move
-            vals[my_floor + a + i] = vals[my_floor + a + b + c - to_move + i]
+        if threadIdx().x <= to_move
+            vals[lo + a + threadIdx().x] = vals[lo + a + b + c - to_move + threadIdx().x]
         end
         sync_threads()
-        if i <= n_eff && i <= to_move
-            vals[my_floor + a + b + c - to_move + i] = swap
+        if threadIdx().x <= to_move
+            vals[lo + a + b + c - to_move + threadIdx().x] = swap
         end
         sync_threads()
         a += c
         b += d
     end
     sync_threads()
-    return my_floor + a
+    return lo + a
 end
 
 #-------------------------------------------------------------------------------
 # Sorting
 """
-Performs bubble sort on `vals` starting after `lo` and going for min(`L`, 1024)
+Performs bubble sort on `vals` starting after `lo` and going for min(`L`, `blockDim().x`)
 elements spaced by `stride`. Good for sampling pivot values as well as short
 sorts.
 """
-@inline function bubble_sort(vals, swap, my_floor, L, i, stride, N_t)
-    if i <= L
-        L = min(Int32(N_t), Int32(L))
-        @inbounds begin
-        swap[i] = vals[my_floor + i * stride]
-        for level in 0:L
-            # get left/right neighbor depending on even/odd level
-            buddy = i - 1 + 2 * (1 & (i % 2 != level % 2))
-            if 1 <= buddy <= L
-                buddy_val = swap[buddy]
-            end
-            sync_threads()
-            if 1 <= buddy <= L
-                if (i < buddy) != (swap[i] < buddy_val)
-                    swap[i] = buddy_val
-                end
-            end
-            sync_threads()
-        end
-        vals[my_floor + i * stride] = swap[i]
-        end
+@inline function bubble_sort(vals, swap, lo, L, stride)
+    sync_threads()
+    L = min(Int32(blockDim().x), Int32(L))
+    @inbounds begin
+    if threadIdx().x <= L
+        swap[threadIdx().x] = vals[lo + threadIdx().x * stride]
     end
+    sync_threads()
+    for level in 0:L
+        # get left/right neighbor depending on even/odd level
+        buddy = threadIdx().x - 1 + 2 * (1 & (threadIdx().x % 2 != level % 2))
+        if 1 <= buddy <= L && threadIdx().x <= L
+            buddy_val = swap[buddy]
+        end
+        sync_threads()
+        if 1 <= buddy <= L && threadIdx().x <= L
+            if (threadIdx().x < buddy) != (swap[threadIdx().x] < buddy_val)
+                swap[threadIdx().x] = buddy_val
+            end
+        end
+        sync_threads()
+    end
+    if threadIdx().x <= L
+        vals[lo + threadIdx().x * stride] = swap[threadIdx().x]
+    end
+    end
+    sync_threads()
 end
 
 """
 Perform quicksort on `vals` for the region with `lo` as an exclusive floor and
 `hi` as an inclusive ceiling.
-`block_dim` must be a Val{N_t} where `N_t` must equal the number of threads this
-    kernel is launched with.
+`parity` is a Val{Bool} which says whether to partition by < or <= with respect
+to the pivot.
 
-Assumes that RUNTIME_SYNC_DEPTH = 24. Recursion ends when `depth` = 24, or when
-`hi` - `lo` <= `N_t`. If `depth` = 24 but `hi` - `lo` > `N_t`, sort may not be
-complete, but further recursion might involve invalid memory accesses.
+This kernel partitions without launching any children kernels, then has recursive
+`qsort_async_kernel` children for left and right partitions. `device_synchronize`
+is never called from this kernel, so there is no practical limit on recursion.
 """
-function qsort_kernel(vals :: CuDeviceArray{T}, lo, hi, global_b_sums, parity :: Val{P}, depth :: Int8) where {T, P}
-    #N_t = blockDim().x
-    b_sums = @cuDynamicSharedMem(Int32, blockDim().x)
+function qsort_async_kernel(vals :: CuDeviceArray{T}, lo, hi, parity :: Val{P}) where {T, P}
+    b_sums = @cuDynamicSharedMem(Int32, blockDim().x, 0)
     swap = @cuDynamicSharedMem(T, blockDim().x, 4 * blockDim().x)
-    i = threadIdx().x
     L = Int32(hi - lo)
-    N_b = ceil_div(L, blockDim().x)
 
     #= step 1 bubble sort. It'll either finish sorting a subproblem or help
     select a pivot value =#
-    bubble_sort(vals, swap, lo, L, i, L <= blockDim().x ? Int32(1) : Int32(L ÷ blockDim().x), blockDim().x)
-    if L <= blockDim().x || depth >= 24
+    bubble_sort(vals, swap, lo, L, L <= blockDim().x ? Int32(1) : Int32(L ÷ blockDim().x))
+
+    if L <= blockDim().x
         return
     end
 
     @inbounds pivot = vals[lo + (blockDim().x ÷ 2) * (L ÷ blockDim().x)]
 
     # step 2: use pivot to partition into batches
-    if i == 1
-        if L <= blockDim().x ^ 2
-            # perform batch partition and do not store partition indices
-            @cuda blocks=N_b threads=blockDim().x dynamic=true shmem=blockDim().x*(4+sizeof(T)) partition_batches_kernel(vals, pivot, lo, L, parity)
-        else
-            # store batch partition indices in global array
-            @cuda blocks=N_b threads=blockDim().x dynamic=true shmem=blockDim().x*(4+sizeof(T)) partition_batches_kernel(vals, pivot, global_b_sums, lo, L, parity)
-        end
+    for temp in lo:blockDim().x:hi
+        batch_partition(vals, pivot, swap, b_sums, temp, Int32(min(hi, temp + blockDim().x)), P)
     end
-    CUDA.device_synchronize()
-    sync_threads()
+
+    #= step 3: consolidate the partitioned batches so that the sublist from
+    [lo, hi) is partitioned, and the partition is stored in `partition`=#
+    partition = consolidate_batch_partition(vals, pivot, lo, L, b_sums, P)
+
+    #= step 4: recursion =#
+    if threadIdx().x == 1
+        s = CuDeviceStream()
+        @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_async_kernel(vals, lo, Int32(partition), Val(!P))
+        CUDA.unsafe_destroy!(s)
+
+        s = CuDeviceStream()
+        @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_async_kernel(vals, Int32(partition), hi, Val(!P))
+        CUDA.unsafe_destroy!(s)
+    end
+
+    return nothing
+end
+
+"""
+Perform quicksort on `vals` for the region with `lo` as an exclusive floor and
+`hi` as an inclusive ceiling.
+`parity` is a Val{Bool} which says whether to partition by < or <= with respect
+to the pivot.
+`sync_depth` is how many (more) levels of recursion with `qsort_kernel`
+can be done before reaching `cudaLimitDevRuntimeSyncDepth`. From the host, this value
+must not exceed that limit.
+
+This kernel partitions batches in a child kernel, synchronizes, and then
+consolidates the batches. The benefit of this kernel is that it distributes
+the work of partitioning batches across multiple SMs.
+"""
+function qsort_kernel(vals :: CuDeviceArray{T}, lo, hi, parity :: Val{P}, sync_depth) where {T, P}
+    b_sums = @cuDynamicSharedMem(Int32, blockDim().x, 0)
+    swap = @cuDynamicSharedMem(T, blockDim().x, 4 * blockDim().x)
+    L = Int32(hi - lo)
+
+    #= step 1 bubble sort. It'll either finish sorting a subproblem or help
+    select a pivot value =#
+    bubble_sort(vals, swap, lo, L, L <= blockDim().x ? Int32(1) : Int32(L ÷ blockDim().x))
+
+    if L <= blockDim().x
+        return
+    end
+
+     pivot = vals[lo + (blockDim().x ÷ 2) * (L ÷ blockDim().x)]
+
+    # step 2: use pivot to partition into batches
+    if threadIdx().x == 1
+        @cuda blocks=ceil(Int, L / blockDim().x) threads=blockDim().x dynamic=true shmem=blockDim().x*(4+sizeof(T)) partition_batches_kernel(vals, pivot, lo, hi, parity)
+        CUDA.device_synchronize()
+    end
+
     #= step 3: consolidate the partitioned batches so that the sublist from
     [lo, hi) is partitioned, and the partition is stored in `partition`=#
 
-    partition = -1
-    if L <= blockDim().x ^ 2
-        #= if small enough, perform binary search to find the partitions in each
-        batch, store in shmem, and use that=#
-        init_bsums(vals, pivot, lo, L, blockDim().x, N_b, i, b_sums, P)
-        partition = consolidate_batch_partition(vals, pivot, lo, L, blockDim().x, N_b, i, b_sums)
-    else
-        #= if more batches than threads per SM, use the global array written to
-        by `partition_batches_kernel`=#
-        partition = consolidate_batch_partition(vals, pivot, lo, L, blockDim().x, N_b, i, global_b_sums)
+    partition = consolidate_batch_partition(vals, pivot, lo, L, b_sums, P)
+
+    #= step 4: recursion =#
+    if threadIdx().x == 1
+        s = CuDeviceStream()
+        if sync_depth > 1
+            @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_kernel(vals, lo, Int32(partition), Val(!P), sync_depth - 1)
+        else
+            @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_async_kernel(vals, lo, Int32(partition), Val(!P))
+        end
+
+        CUDA.unsafe_destroy!(s)
+
+        s = CuDeviceStream()
+        if sync_depth > 1
+            @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_kernel(vals, Int32(partition), hi, Val(!P), sync_depth - 1)
+        else
+            @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_async_kernel(vals, Int32(partition), hi, Val(!P))
+        end
+        CUDA.unsafe_destroy!(s)
     end
 
-    #= step 4: recursion. If the first subproblem doesn't require global mem,
-    run it on a temporary stream. Otherwise run in default stream, so that
-    the two subproblems run serially, and don't conflict over the global array=#
-    if i == 1 && partition > lo
-        if partition - lo <= blockDim().x ^ 2
-            s = CuDeviceStream()
-            @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_kernel(vals, lo, Int32(partition), global_b_sums, Val(!P), depth + Int8(1))
-            CUDA.unsafe_destroy!(s)
-        else
-            @cuda threads=blockDim().x dynamic=true shmem=blockDim().x*(4+sizeof(T)) qsort_kernel(vals, lo, Int32(partition), global_b_sums, Val(!P), depth + Int8(1))
-        end
-    end
-
-    if i == 1 && partition < hi
-        if hi - partition <= blockDim().x ^ 2
-            s = CuDeviceStream()
-            @cuda threads=blockDim().x dynamic=true stream=s shmem=blockDim().x*(4+sizeof(T)) qsort_kernel(vals, Int32(partition), hi, global_b_sums, Val(!P), depth + Int8(1))
-            CUDA.unsafe_destroy!(s)
-        else
-            @cuda threads=blockDim().x dynamic=true shmem=blockDim().x*(4+sizeof(T)) qsort_kernel(vals, Int32(partition), hi, global_b_sums, Val(!P), depth + Int8(1))
-        end
-    end
     return nothing
 end
 
 function quicksort!(c :: CuArray{T}) where T
-    CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, 24)
+    MAX_DEPTH = CUDA.limit(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH)
     N = length(c)
 
     function get_config(kernel)
@@ -382,11 +393,13 @@ function quicksort!(c :: CuArray{T}) where T
         config = launch_configuration(fun, shmem=threads->get_shmem(threads))
         threads = pow2_floor(config.threads)
         @assert threads <= config.threads
-        @assert threads >= 32
         return (blocks=1, threads=threads, shmem=get_shmem(threads))
     end
-
-    b_sums = CuArray{Int32}(undef, ceil_div(N, 32))
-    CUDA.@sync(@cuda config=get_config qsort_kernel(c, Int32(0), N, b_sums, Val(true), Int8(1)))
+    if MAX_DEPTH >= 1
+        @cuda config=get_config qsort_kernel(c, Int32(0), N, Val(true), MAX_DEPTH)
+    else
+        @cuda config=get_config qsort_async_kernel(c, Int32(0), N, Val(true))
+    end
+    synchronize()
+    return nothing
 end
- 

@@ -6,11 +6,11 @@ using DataStructures, Random, Test
 include("../src/sorting.jl")
 
 @testset "Quicksort Integer Functions" begin
-@test pow2_ceil(1) == 1
-@test pow2_ceil(2) == 2
-@test pow2_ceil(3) == 4
-@test pow2_ceil(5) == 8
-@test pow2_ceil(8) == 8
+@test pow2_floor(1) == 1
+@test pow2_floor(2) == 2
+@test pow2_floor(3) == 2
+@test pow2_floor(5) == 4
+@test pow2_floor(8) == 8
 
 @test Θ(0) == 0
 @test Θ(1) == 1
@@ -31,7 +31,6 @@ function test_batch_partition(T, N, lo, hi, seed)
 
     #block_N = ceil_div(hi - lo, block_dim)
     pivot = rand(original[my_range])
-    sums = CuArray(zeros(Int32, ceil_div(hi - lo, 32)))
     block_N, block_dim = -1, -1
 
     function get_config(kernel)
@@ -48,14 +47,12 @@ function test_batch_partition(T, N, lo, hi, seed)
         shmem = get_shmem(threads)
         return (threads=threads, blocks=blocks, shmem=shmem)
     end
-    @cuda config=get_config partition_batches_kernel(A, pivot, sums, lo, hi - lo, Val(true))
+    @cuda config=get_config partition_batches_kernel(A, pivot, lo, hi, Val(true))
     synchronize()
 
     post_sort = Array(A)
-    post_sums = Array(sums)
 
     sort_match = true
-    sums_match = true
 
     for block in 1:block_N
         block_range = lo + 1 + (block - 1) * block_dim: min(hi, lo + block * block_dim)
@@ -64,11 +61,9 @@ function test_batch_partition(T, N, lo, hi, seed)
         each value v is whether v > or <= pivot =#
         expected_sort = vcat(filter(x -> x < pivot, temp), filter(x -> x >= pivot, temp))
         sort_match &= post_sort[block_range] == expected_sort
-        sums_match &= post_sums[block] == count(x -> x >= pivot, temp)
     end
 
     @test sort_match
-    @test sums_match
 end
 
 @testset "Quicksort batch partition" begin
@@ -94,16 +89,17 @@ test_batch_partition(Float32, 10000000, 0, 10000000, 0)
 test_batch_partition(Float32, 10000000, 5000, 500000, 0)
 end
 
-function test_consolidate_kernel(vals, pivot, my_floor, L, N_t, N_b, b_sums, dest)
+function test_consolidate_kernel(vals, pivot, my_floor, L, b_sums, dest, parity)
     i = threadIdx().x
-    p = consolidate_batch_partition(vals, pivot, my_floor, L, N_t, N_b, i, b_sums)
+    p = consolidate_batch_partition(vals, pivot, my_floor, L, b_sums, parity)
     if i == 1
         dest[1] = p
     end
     return nothing
 end
 
-function test_consolidate_partition(T, N, lo, hi, seed)
+function test_consolidate_partition(T, N, lo, hi, seed, block_dim)
+    #@info "$T, $N, $lo, $hi, $seed; $nothing, $shmem=false"
     # assuming partition_batches works, we can validate consolidate by
     # checking that together they partition a large domain
     my_range = lo + 1 : hi
@@ -111,62 +107,35 @@ function test_consolidate_partition(T, N, lo, hi, seed)
     original = rand(T, N)
     A = CuArray(original)
     pivot = rand(original[my_range])
-    block_dim = block_N = -1
-    sums = CuArray(zeros(Int32, ceil_div(hi - lo, 32)))
+
+    threads = blocks = -1
+    sums = CuArray(zeros(Int32, ceil_div(hi - lo, block_dim)))
 
     function get_config(kernel)
         get_shmem(threads) = threads * (sizeof(Int32) + max(4, sizeof(T)))
+        config = launch_configuration(kernel.fun, shmem=threads->get_shmem(threads), max_threads=1024)
 
-        fun = kernel.fun
-        config = launch_configuration(fun, shmem=threads->get_shmem(threads), max_threads=1024)
-
-        threads = pow2_floor(config.threads)
+        threads = isnothing(block_dim) ? pow2_floor(config.threads) : block_dim
         blocks = ceil(Int, (hi - lo) ./ threads)
-        block_N = blocks
-        block_dim = threads
-        @assert block_dim >= 32 "This test assumes block size can be >= 32"
 
         shmem = get_shmem(threads)
         return (threads=threads, blocks=blocks, shmem=shmem)
     end
 
-    @cuda config=get_config partition_batches_kernel(A, pivot, sums, lo, hi - lo, Val(true))
+    @cuda config=get_config partition_batches_kernel(A, pivot, lo, hi, Val(true))
     synchronize()
     dest = CuArray(zeros(Int32, 1))
-    @cuda threads=block_dim test_consolidate_kernel(A, pivot, lo, hi - lo, block_dim, block_N, sums, dest)
+
+    @cuda threads=threads test_consolidate_kernel(A, pivot, lo, hi - lo, sums, dest, true)
     synchronize()
+
     partition = Array(dest)[1]
     temp = original[my_range]
     post_sort = Array(A)
     #= consolidation is a highly unstable sort (again, by pivot comparison as
     the key) so we compare by counting each element =#
     cc(x) = x |> counter |> collect |> sort
-    @test all(post_sort[lo + 1 : partition] |> cc .== filter(x -> x < pivot, temp) |> cc)
-    @test all(post_sort[partition + 1 : hi] |> cc .== filter(x -> x >= pivot, temp) |> cc)
-end
-
-function test_consolidate_partition(T, N, lo, hi, seed, block_dim)
-    # assuming partition_batches works, we can validate consolidate by
-    # checking that together they partition a large domain
-    my_range = lo + 1 : hi
-    Random.seed!(seed)
-    original = rand(T, N)
-    A = CuArray(original)
-    block_N = ceil_div(hi - lo, block_dim)
-    pivot = rand(original[my_range])
-    sums = CuArray(zeros(Int32, block_N))
-
-    @cuda blocks=block_N threads=block_dim shmem=block_dim *(sizeof(Int32) + sizeof(T)) partition_batches_kernel(A, pivot, sums, lo, hi - lo, Val(true))
-    synchronize()
-    dest = CuArray(zeros(Int32, 1))
-    @cuda threads=block_dim test_consolidate_kernel(A, pivot, lo, hi - lo, block_dim, block_N, sums, dest)
-    synchronize()
-    partition = Array(dest)[1]
-    temp = original[my_range]
-    post_sort = Array(A)
-    #= consolidation is a highly unstable sort (again, by pivot comparison as
-    the key) so we compare by counting each element =#
-    cc(x) = x |> counter |> collect |> sort
+    @test cc(original) == cc(post_sort)
     @test all(post_sort[lo + 1 : partition] |> cc .== filter(x -> x < pivot, temp) |> cc)
     @test all(post_sort[partition + 1 : hi] |> cc .== filter(x -> x >= pivot, temp) |> cc)
 end
@@ -194,14 +163,6 @@ test_consolidate_partition(Int8, 10000, 3329, 9999, 10, 16)
 test_consolidate_partition(Int8, 10000, 3329, 9999, 11, 32)
 test_consolidate_partition(Int8, 10000, 3329, 9999, 12, 64)
 
-test_consolidate_partition(Int8, 10000, 0, 10000, 0)
-test_consolidate_partition(Int16, 10000, 0, 10000, 0)
-test_consolidate_partition(Int32, 10000, 0, 10000, 0)
-test_consolidate_partition(Int64, 10000, 0, 10000, 0)
-
-test_consolidate_partition(Float16, 10000, 0, 10000, 0)
-test_consolidate_partition(Float32, 10000, 0, 10000, 1)
-test_consolidate_partition(Float64, 10000, 0, 10000, 2)
 end
 
 function test_quicksort(T, f, N)
@@ -214,16 +175,14 @@ end
 
 @testset "Quicksort" begin
 # test pre-sorted
-test_quicksort(Int, x -> x, 4000000)
-test_quicksort(Int32, x -> x, 4000000)
-test_quicksort(Float64, x -> x, 4000000)
-test_quicksort(Float32, x -> x, 4000000)
+test_quicksort(Int, x -> x, 1000000)
+test_quicksort(Int32, x -> x, 1000000)
+test_quicksort(Float64, x -> x, 1000000)
+test_quicksort(Float32, x -> x, 1000000)
 
 # test reverse sorted
-test_quicksort(Int, x -> -x, 4000000)
-test_quicksort(Int32, x -> -x, 4000000)
-test_quicksort(Float64, x -> -x, 4000000)
-test_quicksort(Float32, x -> -x, 4000000)
+test_quicksort(Int, x -> -x, 1000000)
+test_quicksort(Float32, x -> -x, 1000000)
 
 # test random arrays
 Random.seed!(0)
@@ -235,10 +194,18 @@ test_quicksort(Float64, x -> rand(Float64), 10000)
 test_quicksort(Float32, x -> rand(Float32), 10000)
 test_quicksort(Float16, x -> rand(Float16), 10000)
 
-test_quicksort(Int, x -> rand(Int), 4000000)
-test_quicksort(Int32, x -> rand(Int32), 4000000)
+# test where more copies of each value than fit in one block
 test_quicksort(Int8, x -> rand(Int8), 4000000)
-test_quicksort(Float64, x -> rand(Float64), 4000000)
-test_quicksort(Float32, x -> rand(Float32), 4000000)
-test_quicksort(Float16, x -> rand(Float16), 4000000)
+
+# test various sync depths
+CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, 0)
+test_quicksort(Int, x -> rand(Int), 100000)
+CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, 1)
+test_quicksort(Int, x -> rand(Int), 100000)
+CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, 2)
+test_quicksort(Int, x -> rand(Int), 100000)
+CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, 3)
+test_quicksort(Int, x -> rand(Int), 100000)
+CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, 4)
+test_quicksort(Int, x -> rand(Int), 100000)
 end
