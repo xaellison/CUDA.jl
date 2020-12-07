@@ -3,7 +3,7 @@ Quicksort!
 Alex Ellison
 @xaellison
 Usage:
-quicksort!(my_cuarray)
+sort!(my_cuarray)
 The main quicksort kernel uses dynamic parallelism. Let's call blocksize M. The
 first part of the kernel bubble sorts M elements with maximal stride between
 lo and hi. If the sublist is <= M elements, stride = 1 and no recursion
@@ -23,15 +23,11 @@ Sublists (ranges of the list being sorted) are denoted by `lo` and one of
 `b_sums` is "batch sums", the number of values in a batch which are >= pivot or
     > pivot depending on the relevant `parity`
 """
+module Sorting
+using ..CUDA
 
 #-------------------------------------------------------------------------------
 # Integer arithmetic
-"""
-Equivalent to Int(ceil(a / b))
-"""
-function ceil_div(a, b)
-    return a ÷ b + 1 & (a % b != 0)
-end
 
 """
 Returns smallest power of 2 < x
@@ -383,7 +379,7 @@ function qsort_kernel(vals :: CuDeviceArray{T}, lo, hi, parity :: Val{P}, sync_d
     return nothing
 end
 
-function quicksort!(c :: CuArray{T}) where T
+function quicksort!(c :: AbstractArray{T}) where T
     MAX_DEPTH = CUDA.limit(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH)
     N = length(c)
 
@@ -402,4 +398,10 @@ function quicksort!(c :: CuArray{T}) where T
     end
     synchronize()
     return nothing
+end
+
+function Base.sort!(c :: CuArray{T}) where T
+    quicksort!(c)
+end
+
 end

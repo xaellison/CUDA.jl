@@ -2,8 +2,9 @@
 Unit tests for quicksort.
 """
 
-using DataStructures, Random, Test
-include("../src/sorting.jl")
+using DataStructures, Random, Test, CUDA.Sorting
+import CUDA.Sorting: pow2_floor, Θ, seek_last_less_than,
+        partition_batches_kernel, consolidate_batch_partition
 
 @testset "Quicksort Integer Functions" begin
 @test pow2_floor(1) == 1
@@ -16,9 +17,6 @@ include("../src/sorting.jl")
 @test Θ(1) == 1
 @test Θ(2) == 1
 
-@test ceil_div(3, 2) == 2
-@test ceil_div(4, 2) == 2
-
 @test seek_last_less_than([1, 2, 2, 3, 4, 1, 2, 2, 3, 4], 3, 0, 5, true) == 3
 @test seek_last_less_than([1, 2, 2, 3, 4, 1, 2, 2, 3, 4], 3, 5, 10, true) == 8
 end
@@ -29,7 +27,6 @@ function test_batch_partition(T, N, lo, hi, seed)
     original = rand(T, N)
     A = CuArray(original)
 
-    #block_N = ceil_div(hi - lo, block_dim)
     pivot = rand(original[my_range])
     block_N, block_dim = -1, -1
 
@@ -109,7 +106,7 @@ function test_consolidate_partition(T, N, lo, hi, seed, block_dim)
     pivot = rand(original[my_range])
 
     threads = blocks = -1
-    sums = CuArray(zeros(Int32, ceil_div(hi - lo, block_dim)))
+    sums = CuArray(zeros(Int32, ceil(Int, hi - lo / block_dim)))
 
     function get_config(kernel)
         get_shmem(threads) = threads * (sizeof(Int32) + max(4, sizeof(T)))
@@ -168,7 +165,10 @@ end
 function test_quicksort(T, f, N)
     a = map(x -> T(f(x)), 1:N)
     c = CuArray(a)
-    quicksort!(c)
+    # if sort! fell back to Base implementation, CUDA would error over
+    # disallowed scalar indexing
+    CUDA.allowscalar(false)
+    sort!(c)
     @test Array(c) == sort(a)
 end
 
