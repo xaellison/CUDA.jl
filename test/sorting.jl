@@ -173,7 +173,7 @@ function test_quicksort(T, f, N)
 end
 
 
-@testset "Quicksort" begin
+@not_if_memcheck @testset "Quicksort" begin
 # test pre-sorted
 test_quicksort(Int, x -> x, 1000000)
 test_quicksort(Int32, x -> x, 1000000)
