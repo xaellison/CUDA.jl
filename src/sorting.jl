@@ -67,11 +67,11 @@ of those comparisons, and performs one movement using shmem. Comparison is
 affected by `parity`. See `flex_lt`. `swap` is an array for exchanging values
 and `sums` is an array of Ints used during the merge sort.
 
-Uses block y index to decide which values to operate on.
+Uses block x index to decide which values to operate on.
 """
 @inline function batch_partition(values, pivot, swap, sums, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
     sync_threads()
-    idx0 = lo + (blockIdx().y - 1) * blockDim().x + threadIdx().x
+    idx0 = lo + (blockIdx().x - 1) * blockDim().x + threadIdx().x
     val = idx0 <= hi ? values[idx0] : one(eltype(values))
     comparison = flex_lt(pivot, val, parity, lt, by)
 
@@ -246,7 +246,7 @@ Launch batch partition kernel and sync
                                       parity, sync::Val{true}, lt::F1, by::F2) where {T, F1, F2}
     L = hi - lo
     if threadIdx().x == 1
-        @cuda(blocks=(1,ceil(Int, L / blockDim().x)), threads=blockDim().x, dynamic=true,
+        @cuda(blocks= cld(L , blockDim().x), threads=blockDim().x, dynamic=true,
               shmem=blockDim().x*(sizeof(Int)+sizeof(T)),
               partition_batches_kernel(vals, pivot, lo, hi, parity, lt, by))
         CUDA.device_synchronize()
