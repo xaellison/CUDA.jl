@@ -3,7 +3,8 @@ using DataStructures
 
 @testset "quicksort" begin
 
-import CUDA.Quicksort: flex_lt, find_partition
+import CUDA.Quicksort: flex_lt, find_partition, partition_batches_kernel,
+            consolidate_batch_partition
 
 @testset "integer functions" begin
 
