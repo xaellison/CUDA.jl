@@ -30,6 +30,15 @@ using ..CUDA
 
 # Comparison
 
+function log2_shift(k :: Integer)
+    out = 0
+        while k > 1
+            k = k >> 1
+            out += 1
+        end
+    out
+end
+
 @inline function flex_lt(a, b, eq, lt, by)
     a′ = by(a)
     b′ = by(b)
@@ -239,6 +248,58 @@ elements spaced by `stride`. Good for sampling pivot values as well as short sor
     sync_threads()
 end
 
+
+function bitonic(vals :: AbstractArray{T}, swap, oob, lo, L, stride, lt::F1, by::F2) where {T,F1,F2}
+    sync_threads()
+    bitonic_lt(i1, i2) = if oob[i1 + 1] == oob[i2 + 1]
+                             flex_lt(swap[i1 + 1], swap[i2 + 1], false, lt, by)
+                         else
+                              oob[i1 + 1] < oob[i2 + 1]
+                         end
+
+    if threadIdx().x <= L ÷ stride
+        swap[threadIdx().x] = vals[lo + threadIdx().x * stride]
+    end
+    oob[threadIdx().x] = (1 & (threadIdx().x > L))
+    sync_threads()
+    old_val = zero(eltype(swap))
+    old_oob = zero(eltype(oob))
+    log_blockDim = log2_shift(blockDim().x)
+    for log_k in 1:log_blockDim
+        k = 1 << log_k
+        j = k ÷ 2
+        #for log_j in log_k - 1:-1:0
+        #    j = 1 << log_j
+        while j > 0
+            i = threadIdx().x - 1
+            l = xor(i, j)
+            to_swap = (i & k) == 0 && bitonic_lt(l, i) || (i & k) != 0 && bitonic_lt(i, l)
+            to_swap = to_swap == (i < l)
+
+            if to_swap
+                old_val = swap[l + 1]
+                old_oob = oob[l + 1]
+            end
+            sync_threads()
+            if to_swap
+                swap[i+1] = old_val
+                 oob[i+1] = old_oob
+            end
+            sync_threads()
+            j = j ÷ 2
+        end
+
+    #    k *= 2
+    end
+    sync_threads()
+    if threadIdx().x <= L
+        vals[lo + threadIdx().x * stride] = swap[threadIdx().x]
+    end
+    sync_threads()
+end
+
+
+
 """
 Launch batch partition kernel and sync
 """
@@ -310,7 +371,7 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
 
     # step 1: bubble sort. It'll either finish sorting a subproblem or help select a pivot
     #         value
-    bubble_sort(slice, swap, lo, L, L <= blockDim().x ? 1 : L ÷ blockDim().x, lt, by)
+    bitonic(slice, swap, b_sums, lo, L, L <= blockDim().x ? 1 : L ÷ blockDim().x, lt, by)
 
     if L <= blockDim().x
         return
