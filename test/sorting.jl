@@ -3,14 +3,10 @@ using DataStructures
 
 @testset "quicksort" begin
 
-import CUDA.Quicksort: Θ, flex_lt, find_partition,
+import CUDA.Quicksort: flex_lt, find_partition,
         partition_batches_kernel, consolidate_batch_partition
 
 @testset "integer functions" begin
-    @test Θ(0) == 0
-    @test Θ(1) == 1
-    @test Θ(2) == 1
-
     @test flex_lt(1, 2, false, isless, identity) == true
     @test flex_lt(1, 2, true, isless, identity) == true
     @test flex_lt(2, 2, false, isless, identity) == false

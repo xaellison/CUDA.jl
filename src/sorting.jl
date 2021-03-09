@@ -6,19 +6,16 @@ of the kernel bubble sorts `M` elements with maximal stride between `lo` and `hi
 sublist is <= `M` elements, `stride` = 1 and no recursion happens. Otherwise, we pick
 element `lo + M ÷ 2 * stride` as a pivot. This is an efficient choice for random lists and
 pre-sorted lists.
-
 Partition is done in stages:
 1. Merge-sort batches of M values using their comparison to pivot as a key. The comparison
    alternates between < and <= with recursion depth. This makes no difference when there are
    many unique values, but when there are many duplicates, this effectively partitions into
    <, =, and >.
 2. Consolidate batches. This runs inside the quicksort kernel.
-
 Sublists (ranges of the list being sorted) are denoted by `lo` and one of `L` and `hi`. `lo`
 is an exclusive lower bound, `hi` is an inclusive upperboard, `L` is their difference.
 `b_sums` is "batch sums", the number of values in a batch which are >= pivot or > pivot
 depending on the relevant `parity`
-
 Originally developed by @xaellison (Alex Ellison).
 """
 module Quicksort
@@ -28,47 +25,7 @@ export quicksort!
 using ..CUDA
 
 
-# Integer arithmetic
-
-"""
-For a batch of size `n` what is the lowest index of the batch `i` is in
-"""
-function batch_floor(idx, n)
-    return idx - (idx - 1) % n
-end
-
-"""
-For a batch of size `n` what is the highest index of the batch `i` is in
-"""
-function batch_ceil(idx, n)
-    return idx + n - 1 - (idx - 1) % n
-end
-
-"""
-GPU friendly step function (step at `i` = 1)
-"""
-function Θ(i)
-    return 1 & (1 <= i)
-end
-
-"""
-Suppose we are merging two lists of size n, each of which has all falses before
-all trues. Together, they will be indexed 1:2n. This is a fast stepwise function
-for the destination index of a value at index `x` in the concatenated input,
-where `a` is the number of falses in the first half, b = n - a, and false is the
-number of falses in the second half.
-"""
-function step_swap(x, a, b, c)
-    return x + Θ(x - a) * b - Θ(x - (a + c)) * (b + c) + Θ(x - (a + b + c)) * c
-end
-
-"""
-Generalizes `step_swap` for when the floor index is not 1
-"""
-function batch_step_swap(x, n, a, b, c)
-    idx = (x - 1) % n + 1
-    return batch_floor(x, n) - 1 + step_swap(idx, a, b, c)
-end
+# Comparison
 
 @inline function flex_lt(a, b, eq, lt, by)
     a′ = by(a)
@@ -78,54 +35,59 @@ end
 
 
 # Batch partitioning
+"""
+Performs in-place cumsum using shared memory. Intended for use with indexes
+"""
+function cumsum!(sums)
+    shift = 1
 
-"""
-For thread `idx` with current value `value`, merge two batches of size `n` and
-return the new value this thread takes. `sums` and `swap` are shared mem
-"""
-function merge_swap_shmem(value, idx, n, sums, swap)
-    @inbounds begin
+    while shift < length(sums)
+        to_add = 0
+        @inbounds if threadIdx().x - shift > 0
+            to_add = sums[threadIdx().x - shift]
+        end
+
         sync_threads()
-        b = sums[batch_floor(idx, 2 * n)]
-        a = n - b
-        d = sums[batch_ceil(idx, 2 * n)]
-        c = n - d
-        swap[idx] = value
+        @inbounds if threadIdx().x - shift > 0
+            sums[threadIdx().x] += to_add
+        end
+
         sync_threads()
-        sums[idx] = d + b
-        return swap[batch_step_swap(idx, 2 * n, a, b, c)]
+        shift *= 2
     end
 end
 
 """
 Partition the region of `values` after index `lo` up to (inclusive) `hi` with
-respect to `pivot`. This is done by a 'binary' merge sort, where each the values
-are sorted by a boolean key: how they compare to `pivot`. The comparison is
+respect to `pivot`. Computes each value's comparison to pivot, performs a cumsum
+of those comparisons, and performs one movement using shmem. Comparison is
 affected by `parity`. See `flex_lt`. `swap` is an array for exchanging values
 and `sums` is an array of Ints used during the merge sort.
-
 Uses block y index to decide which values to operate on.
 """
 @inline function batch_partition(values, pivot, swap, sums, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
     sync_threads()
     idx0 = lo + (blockIdx().y - 1) * blockDim().x + threadIdx().x
+    val = idx0 <= hi ? values[idx0] : one(eltype(values))
+    comparison = flex_lt(pivot, val, parity, lt, by)
+
     @inbounds if idx0 <= hi
-         swap[threadIdx().x] = values[idx0]
-         sums[threadIdx().x] = 1 & flex_lt(pivot, swap[threadIdx().x], parity, lt, by)
+         sums[threadIdx().x] = 1 & comparison
     else
          sums[threadIdx().x] = 1
     end
     sync_threads()
-    val = merge_swap_shmem(@inbounds(swap[threadIdx().x]), threadIdx().x, 1, sums, swap)
-    temp = 2
-    while temp < blockDim().x
-        val = merge_swap_shmem(val, threadIdx().x, temp, sums, swap)
-        temp *= 2
+
+    cumsum!(sums)
+
+    dest_idx = @inbounds comparison ? blockDim().x - sums[end] + sums[threadIdx().x] : threadIdx().x - sums[threadIdx().x]
+    @inbounds if idx0 <= hi && dest_idx <= length(swap)
+        swap[dest_idx] = val
     end
     sync_threads()
 
     @inbounds if idx0 <= hi
-         values[idx0] = val
+         values[idx0] = swap[threadIdx().x]
     end
     sync_threads()
 end
@@ -168,15 +130,11 @@ end
 This assumes the region of `vals` of length `L` starting after `lo`
 has been batch partitioned with respect to `pivot`. Further, it assumes that
 these batches are of size `blockDim().x`.
-
 Using 1 step per batch, consolidate these partitioned batches such that the
 region is fully partitioned. Each step moves at most `blockDim().x` values.
-
 `b_sums`: either shared memory or a global array which serves as scratch space
 for storing the partition of each batch.
-
 `parity`: see top docstring
-
 Must only run on 1 SM.
 """
 @inline function consolidate_batch_partition(vals::AbstractArray{T}, pivot, lo, L, b_sums,
@@ -304,7 +262,6 @@ floor and `hi` as an inclusive ceiling. `parity` is a boolean which says whether
 partition by < or <= with respect to the pivot. `sync_depth` is how many (more) levels of
 recursion with `qsort_kernel` can be done before reaching `cudaLimitDevRuntimeSyncDepth`.
 From the host, this value must not exceed that limit.
-
 `sync` and enclosed type `S` determine how partition occurs: If `sync` is `true`, the kernel
 partitions batches in a child kernel, synchronizes, and then consolidates the batches. The
 benefit of this kernel is that it distributes the work of partitioning batches across
@@ -312,7 +269,6 @@ multiple SMs. If `sync` is `false`, the kernel partitions without launching any 
 kernels, then has recursive `qsort_kernel` children for left and right partitions.
 `device_synchronize` is never called from this kernel, so there is no practical limit on
 recursion.
-
 To detect the scenario of all values in the region being the same, we have two args:
 `prev_pivot` and `stuck`. If two consecutive partitions have the same pivot and both failed
 to split the region in two, that means all the values are equal. `stuck` is incremented when
