@@ -86,7 +86,7 @@ Uses block y index to decide which values to operate on.
     end
     sync_threads()
 
-    @inbounds if idx0 <= hi
+    @inbounds if global_write && idx0 <= hi
          values[idx0] = swap[threadIdx().x]
     end
     sync_threads()
