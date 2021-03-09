@@ -90,6 +90,7 @@ Uses block y index to decide which values to operate on.
          values[idx0] = swap[threadIdx().x]
     end
     sync_threads()
+    return blockDim().x - sums[end]
 end
 
 """
@@ -130,13 +131,38 @@ end
 This assumes the region of `vals` of length `L` starting after `lo`
 has been batch partitioned with respect to `pivot`. Further, it assumes that
 these batches are of size `blockDim().x`.
+
 Using 1 step per batch, consolidate these partitioned batches such that the
 region is fully partitioned. Each step moves at most `blockDim().x` values.
+
 `b_sums`: either shared memory or a global array which serves as scratch space
 for storing the partition of each batch.
+
 `parity`: see top docstring
+
 Must only run on 1 SM.
 """
+
+@inline function execute_consolidation(vals, lo, a, b, c, d)
+    to_move = min(b, c)
+    sync_threads()
+    swap = if threadIdx().x <= to_move
+        vals[lo + a + threadIdx().x]
+    else
+        zero(eltype(vals))  # unused value
+    end
+    sync_threads()
+    if threadIdx().x <= to_move
+        vals[lo + a + threadIdx().x] = vals[lo + a + b + c - to_move + threadIdx().x]
+    end
+    sync_threads()
+    if threadIdx().x <= to_move
+        vals[lo + a + b + c - to_move + threadIdx().x] = swap
+    end
+    sync_threads()
+    return a + c, b + d
+end
+
 @inline function consolidate_batch_partition(vals::AbstractArray{T}, pivot, lo, L, b_sums,
                                              parity, lt::F1, by::F2) where {T,F1,F2}
     sync_threads()
@@ -165,28 +191,10 @@ Must only run on 1 SM.
                 L % blockDim().x
             end
         end
-
         sync_threads()
         d = b_sums[batch_i - (my_iter - 1) * blockDim().x]
         c = n_eff() - d
-        to_move = min(b, c)
-        sync_threads()
-        swap = if threadIdx().x <= to_move
-            vals[lo + a + threadIdx().x]
-        else
-            zero(eltype(vals))  # unused value
-        end
-        sync_threads()
-        if threadIdx().x <= to_move
-            vals[lo + a + threadIdx().x] = vals[lo + a + b + c - to_move + threadIdx().x]
-        end
-        sync_threads()
-        if threadIdx().x <= to_move
-            vals[lo + a + b + c - to_move + threadIdx().x] = swap
-        end
-        sync_threads()
-        a += c
-        b += d
+        a, b = execute_consolidation(vals, lo, a, b, c, d)
     end
 
     sync_threads()
@@ -250,10 +258,47 @@ Partition batches in a loop using a single block
 """
 @inline function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
                                       parity, sync::Val{false}, lt::F1, by::F2) where {T, F1, F2}
-    while lo <= hi
+    L = hi - lo
+    @inline N_b() = ceil(Int, L / blockDim().x)
+
+    @inbounds for batch_i in 1:N_b()
         batch_partition(vals, pivot, swap, b_sums, lo, min(hi, lo + blockDim().x), parity, lt, by)
         lo += blockDim().x
     end
+end
+
+@inline function partition!(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi, parity, sync::Val{true}, lt::F1, by::F2) where {T, F1, F2}
+    a = 0
+    b = 0
+    L = hi - lo
+    @inline N_b() = ceil(Int, L / blockDim().x)
+    batch_lo = lo
+    @inbounds for batch_i in 1:N_b()
+        c = batch_partition(vals, pivot, swap, b_sums, batch_lo, min(hi, batch_lo + blockDim().x), parity, lt, by)
+
+        # consolidate:
+        function n_eff()
+            if batch_i != ceil(Int, L / blockDim().x) || L % blockDim().x == 0
+                blockDim().x
+            else
+                L % blockDim().x
+            end
+        end
+
+        sync_threads()
+        d = n_eff() - c
+        a, b = execute_consolidation(vals, lo, a, b, c, d)
+
+        batch_lo += blockDim().x
+    end
+    return  lo + a
+#    return consolidate_batch_partition(vals, pivot, lo, hi - lo, b_sums, parity, lt, by)
+end
+
+@inline function partition!(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi, parity, sync::Val{false}, lt::F1, by::F2) where {T, F1, F2}
+
+    call_batch_partition(vals, pivot, swap, b_sums, lo, hi, parity, sync, lt, by)
+    return consolidate_batch_partition(vals, pivot, lo, hi - lo, b_sums, parity, lt, by)
 end
 
 """
@@ -262,6 +307,7 @@ floor and `hi` as an inclusive ceiling. `parity` is a boolean which says whether
 partition by < or <= with respect to the pivot. `sync_depth` is how many (more) levels of
 recursion with `qsort_kernel` can be done before reaching `cudaLimitDevRuntimeSyncDepth`.
 From the host, this value must not exceed that limit.
+
 `sync` and enclosed type `S` determine how partition occurs: If `sync` is `true`, the kernel
 partitions batches in a child kernel, synchronizes, and then consolidates the batches. The
 benefit of this kernel is that it distributes the work of partitioning batches across
@@ -269,6 +315,7 @@ multiple SMs. If `sync` is `false`, the kernel partitions without launching any 
 kernels, then has recursive `qsort_kernel` children for left and right partitions.
 `device_synchronize` is never called from this kernel, so there is no practical limit on
 recursion.
+
 To detect the scenario of all values in the region being the same, we have two args:
 `prev_pivot` and `stuck`. If two consecutive partitions have the same pivot and both failed
 to split the region in two, that means all the values are equal. `stuck` is incremented when
@@ -309,13 +356,13 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
     pivot = @inbounds slice[lo + (blockDim().x ÷ 2) * (L ÷ blockDim().x)]
 
     # step 2: use pivot to partition into batches
-    call_batch_partition(slice, pivot, swap, b_sums, lo, hi, parity, sync, lt, by)
+    partition = partition!(slice, pivot, swap, b_sums, lo, hi, parity, sync, lt, by)
 
     # step 3: consolidate the partitioned batches so that the sublist from [lo, hi) is
     #         partitioned, and the partition is stored in `partition`. Dispatching on P
     #         cleaner and faster than an if statement
 
-    partition = consolidate_batch_partition(slice, pivot, lo, L, b_sums, parity, lt, by)
+#    partition = consolidate_batch_partition(slice, pivot, lo, L, b_sums, parity, lt, by)
 
     # step 4: recursion
     if threadIdx().x == 1
