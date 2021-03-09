@@ -65,7 +65,7 @@ affected by `parity`. See `flex_lt`. `swap` is an array for exchanging values
 and `sums` is an array of Ints used during the merge sort.
 Uses block y index to decide which values to operate on.
 """
-@inline function batch_partition(values, pivot, swap, sums, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
+@inline function batch_partition(values, pivot, swap, sums, lo, hi, parity, lt::F1, by::F2, global_write::Bool=true) where {F1,F2}
     sync_threads()
     idx0 = lo + (blockIdx().y - 1) * blockDim().x + threadIdx().x
     val = idx0 <= hi ? values[idx0] : one(eltype(values))
@@ -128,6 +128,34 @@ function find_partition(array, pivot, lo, hi, parity, lt::F1, by::F2) where {F1,
 end
 
 """
+Consolidate partitioned `addition` onto `bulk` such that `bulk` is one
+larger partitioned view.
+"""
+@inline function execute_consolidation(bulk, a, b, addition, c, d)
+    to_move = min(b, c)
+    sync_threads()
+    swap = if threadIdx().x <= to_move
+        bulk[a + threadIdx().x]
+    else
+        zero(eltype(bulk))  # unused value
+    end
+    sync_threads()
+    if threadIdx().x <= to_move
+        bulk[a + threadIdx().x] = addition[c - to_move + threadIdx().x]
+    end
+    sync_threads()
+    if threadIdx().x <= to_move
+        bulk[a + b + c - to_move + threadIdx().x] = swap
+    end
+    sync_threads()
+    if threadIdx().x <= d
+        bulk[a+b+c+threadIdx().x] = addition[c+threadIdx().x]
+    end
+    sync_threads()
+    return a + c, b + d
+end
+
+"""
 This assumes the region of `vals` of length `L` starting after `lo`
 has been batch partitioned with respect to `pivot`. Further, it assumes that
 these batches are of size `blockDim().x`.
@@ -142,27 +170,6 @@ for storing the partition of each batch.
 
 Must only run on 1 SM.
 """
-
-@inline function execute_consolidation(vals, lo, a, b, c, d)
-    to_move = min(b, c)
-    sync_threads()
-    swap = if threadIdx().x <= to_move
-        vals[lo + a + threadIdx().x]
-    else
-        zero(eltype(vals))  # unused value
-    end
-    sync_threads()
-    if threadIdx().x <= to_move
-        vals[lo + a + threadIdx().x] = vals[lo + a + b + c - to_move + threadIdx().x]
-    end
-    sync_threads()
-    if threadIdx().x <= to_move
-        vals[lo + a + b + c - to_move + threadIdx().x] = swap
-    end
-    sync_threads()
-    return a + c, b + d
-end
-
 @inline function consolidate_batch_partition(vals::AbstractArray{T}, pivot, lo, L, b_sums,
                                              parity, lt::F1, by::F2) where {T,F1,F2}
     sync_threads()
@@ -194,7 +201,7 @@ end
         sync_threads()
         d = b_sums[batch_i - (my_iter - 1) * blockDim().x]
         c = n_eff() - d
-        a, b = execute_consolidation(vals, lo, a, b, c, d)
+        a, b = execute_consolidation(view(vals, lo+1:length(vals)), a, b, view(vals, lo + a + b + 1:length(vals)), c, d)
     end
 
     sync_threads()
@@ -274,8 +281,8 @@ end
     @inline N_b() = ceil(Int, L / blockDim().x)
     batch_lo = lo
     @inbounds for batch_i in 1:N_b()
-        c = batch_partition(vals, pivot, swap, b_sums, batch_lo, min(hi, batch_lo + blockDim().x), parity, lt, by)
-
+        c = batch_partition(vals, pivot, swap, b_sums, batch_lo, min(hi, batch_lo + blockDim().x), parity, lt, by, false)
+        #swap[threadIdx().x] = T(0)
         # consolidate:
         function n_eff()
             if batch_i != ceil(Int, L / blockDim().x) || L % blockDim().x == 0
@@ -287,12 +294,11 @@ end
 
         sync_threads()
         d = n_eff() - c
-        a, b = execute_consolidation(vals, lo, a, b, c, d)
+        a, b = execute_consolidation(view(vals, lo+1:length(vals)), a, b, swap, c, d)
 
         batch_lo += blockDim().x
     end
-    return  lo + a
-#    return consolidate_batch_partition(vals, pivot, lo, hi - lo, b_sums, parity, lt, by)
+    return lo + a
 end
 
 @inline function partition!(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi, parity, sync::Val{false}, lt::F1, by::F2) where {T, F1, F2}
