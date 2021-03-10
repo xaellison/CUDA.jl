@@ -134,20 +134,16 @@ larger partitioned view.
 @inline function execute_consolidation(bulk, a, b, addition, c, d)
     to_move = min(b, c)
     sync_threads()
-    swap = if threadIdx().x <= to_move
-        bulk[a + threadIdx().x]
-    else
-        zero(eltype(bulk))  # unused value
+
+    if threadIdx().x <= to_move
+        bulk[a + b + c - to_move + threadIdx().x] = bulk[a + threadIdx().x]
     end
     sync_threads()
     if threadIdx().x <= to_move
         bulk[a + threadIdx().x] = addition[c - to_move + threadIdx().x]
     end
-    sync_threads()
-    if threadIdx().x <= to_move
-        bulk[a + b + c - to_move + threadIdx().x] = swap
-    end
-    sync_threads()
+
+    #sync_threads()
     if threadIdx().x <= d
         bulk[a+b+c+threadIdx().x] = addition[c+threadIdx().x]
     end
