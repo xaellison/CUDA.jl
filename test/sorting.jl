@@ -1,5 +1,6 @@
 using Random
 using DataStructures
+using Serialization
 
 @testset "quicksort" begin
 
@@ -186,8 +187,18 @@ function check_equivalence(a::Array, c::Array; dims, kwargs...)
 
     remdims = ntuple(i -> i == k ? 1 : size(c, i), nd)
     v(a, idx) = view(a, ntuple(i -> i == k ? Colon() : idx[i], nd)...)
-    all(counter(v(a, idx)) == counter(v(c, idx)) && issorted(v(c, idx); kwargs...)
+    out = all(counter(v(a, idx)) == counter(v(c, idx)) && issorted(v(c, idx); kwargs...)
         for idx in CartesianIndices(remdims))
+    if ! out
+        f = open("dump_$(time())", "w+")
+        print("domp")
+        if a == c
+            println("unchanged!")
+        end
+        serialize(f, (dims, kwargs, a, c))
+        close(f)
+    end
+    out
 end
 
 """
@@ -199,13 +210,16 @@ end
 function check_sort!(T, N, f=identity; kwargs...)
     original_arr, device_arr = init_case(T, f, N)
     sort!(device_arr; kwargs...)
+    synchronize()
     host_result = Array(device_arr)
     check_equivalence(original_arr, host_result; kwargs...)
 end
 
 function check_sort(T, N, f=identity; kwargs...)
     original_arr, device_arr = init_case(T, f, N)
-    host_result = Array(sort(device_arr; kwargs...))
+    sort(device_arr; kwargs...)
+    synchronize()
+    host_result = Array(device_arr)
     check_equivalence(original_arr, host_result; kwargs...)
 end
 
@@ -221,11 +235,12 @@ end
     @test check_sort!(Float32, 1000000; rev=true)
 
     # reverse sorted
+    for iter in 1:10
     @test check_sort!(Int32, 1000000, x -> -x)
     @test check_sort!(Float32, 1000000, x -> -x)
     @test check_sort!(Int32, 1000000, x -> -x; rev=true)
     @test check_sort!(Float32, 1000000, x -> -x; rev=true)
-
+end
     @test check_sort!(Int, 10000, x -> rand(Int))
     @test check_sort!(Int32, 10000, x -> rand(Int32))
     @test check_sort!(Int8, 10000, x -> rand(Int8))
@@ -241,9 +256,10 @@ end
     @test check_sort!(Int8, 4000000, x -> rand(Int8))
 
     # multiple dimensions
+    for iter in 1:10
     @test check_sort!(Int32, (4, 50000, 4); dims=2)
     @test check_sort!(Int32, (4, 4, 50000); dims=3, rev=true)
-
+end
     # various sync depths
     for depth in 0:4
         CUDA.limit!(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH, depth)
@@ -251,8 +267,15 @@ end
     end
 
     # using a `by` argument
+    for iter in 1:10
     @test check_sort(Float32, 100000; by=x->abs(x - 0.5))
+    @test check_sort(Float32, (100000, 4); by=x->abs(x - 0.5), dims=1)
+    @test check_sort(Float32, (4, 100000); by=x->abs(x - 0.5), dims=2)
+    @test check_sort(Float64, 400000; by=x->8*x-round(8*x))
+
+    @test check_sort(Float64, (100000, 4); by=x->8*x-round(8*x), dims=1)
     @test check_sort(Float64, (4, 100000); by=x->8*x-round(8*x), dims=2)
+end
 end
 
 end

@@ -245,8 +245,9 @@ function bitonic(vals :: AbstractArray{T}, swap, lo, L, stride, lt::F1, by::F2) 
         log_k += 1
     end
     sync_threads()
-    @inbounds vals[lo + threadIdx().x * stride] = swap[threadIdx().x]
-    sync_threads()
+    #@inbounds vals[lo + threadIdx().x * stride] = swap[threadIdx().x]
+    #sync_threads()
+    return swap[blockDim().x ÷ 2]
 end
 
 """
@@ -282,6 +283,7 @@ elements spaced by `stride`. Good for sampling pivot values as well as short sor
         end
     end
     sync_threads()
+    return swap[blockDim().x ÷ 2]
 end
 
 """
@@ -355,17 +357,15 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
 
     # step 1: single block bubble sort. It'll either finish sorting a subproblem or
     # help select a pivot value
-    if L <= blockDim().x
+    pivot = if L <= blockDim().x
         bubble_sort(slice, swap, lo, L, 1, lt, by)
         return
     else
         bitonic(slice, swap, lo, L, L ÷ blockDim().x, lt, by)
     end
 
-    pivot = @inbounds slice[lo + (blockDim().x ÷ 2) * (L ÷ blockDim().x)]
-
     # step 2: use pivot to partition into batches
-    call_batch_partition(slice, pivot, swap, b_sums, lo, hi, parity, sync, lt, by)
+    call_batch_partition(slice, pivot, swap, b_sums, lo, hi, parity, Val(N != 1 && S), lt, by)
 
     # step 3: consolidate the partitioned batches so that the sublist from [lo, hi) is
     #         partitioned, and the partition is stored in `partition`. Dispatching on P
@@ -422,7 +422,7 @@ function quicksort!(c::AbstractArray{T,N}; lt::F1, by::F2, dims::Int) where {T,N
     get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
     config = launch_configuration(kernel.fun, shmem=threads->get_shmem(threads))
     threads = prevpow(2, config.threads)
-
+    @info "blocks = $(prod(otherdims))"
     kernel(c, 0, len, true, Val(max_depth > 1), max_depth, nothing, lt, by, Val(dims);
            blocks=prod(otherdims), threads=threads, shmem=get_shmem(threads))
 
