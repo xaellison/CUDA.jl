@@ -41,7 +41,7 @@ end
 """
 Performs in-place cumsum using shared memory. Intended for use with indexes
 """
-function cumsum!(sums)
+@inline function cumsum!(sums)
     shift = 1
 
     while shift < length(sums)
@@ -68,7 +68,7 @@ affected by `parity`. See `flex_lt`. `swap` is an array for exchanging values
 and `sums` is an array of Ints used during the merge sort.
 Uses block y index to decide which values to operate on.
 """
-@inline function batch_partition(values, pivot, swap, sums, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
+ function batch_partition(values, pivot, swap, sums, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
     sync_threads()
     blockIdx_yz = (blockIdx().z - 1) * gridDim().y + blockIdx().y
     idx0 = lo + (blockIdx_yz - 1) * blockDim().x + threadIdx().x
@@ -116,7 +116,7 @@ Finds the index in `array` of the last value <= `pivot` if `parity` = true or th
 last value < `pivot` if `parity` = false.
 Searches after index `lo` up to (inclusive) index `hi`
 """
-function find_partition(array, pivot, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
+@inline function find_partition(array, pivot, lo, hi, parity, lt::F1, by::F2) where {F1,F2}
     low = lo + 1
     high = hi
     @inbounds while low <= high
@@ -166,7 +166,7 @@ Must only run on 1 SM.
             my_iter += 1
         end
 
-        function n_eff()
+        @inline function n_eff()
             if batch_i != N_b() || L % blockDim().x == 0
                 blockDim().x
             else
@@ -179,18 +179,9 @@ Must only run on 1 SM.
         c = n_eff() - d
         to_move = min(b, c)
         sync_threads()
-        swap = if threadIdx().x <= to_move
-            vals[lo + a + threadIdx().x]
-        else
-            zero(eltype(vals))  # unused value
-        end
-        sync_threads()
+
         if threadIdx().x <= to_move
-            vals[lo + a + threadIdx().x] = vals[lo + a + b + c - to_move + threadIdx().x]
-        end
-        sync_threads()
-        if threadIdx().x <= to_move
-            vals[lo + a + b + c - to_move + threadIdx().x] = swap
+            vals[lo + a + threadIdx().x], vals[lo + a + b + c - to_move + threadIdx().x] = vals[lo + a + b + c - to_move + threadIdx().x], vals[lo + a + threadIdx().x]
         end
         sync_threads()
         a += c
@@ -295,7 +286,7 @@ end
 """
 Launch batch partition kernel and sync
 """
-@inline function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
+ function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
                                       parity, sync::Val{true}, lt::F1, by::F2) where {T, F1, F2}
     L = hi - lo
     if threadIdx().x == 1
@@ -319,7 +310,7 @@ end
 """
 Partition batches in a loop using a single block
 """
-@inline function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
+ function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
                                       parity, sync::Val{false}, lt::F1, by::F2) where {T, F1, F2}
     while lo <= hi
         batch_partition(vals, pivot, swap, b_sums, lo, min(hi, lo + blockDim().x), parity, lt, by)
@@ -391,13 +382,14 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
 
     # step 1: single block sort. It'll either finish sorting a subproblem or
     # help select a pivot value
-
+    #bubble_sort(slice, swap, lo, L, L < blockDim().x ? 1 : L ÷ blockDim().x, lt, by)
     if L <= blockDim().x
         bubble_sort(slice, swap, lo, L, 1, lt, by)
         return
     end
 
-    pivot = bitonic_median(slice, swap, lo, L, L ÷ blockDim().x, lt, by)
+#    pivot = @inbounds slice[lo + L ÷ blockDim().x * blockDim().x ÷ 2]# bitonic_median(slice, swap, lo, L, L ÷ blockDim().x, lt, by)
+    pivot = @inbounds slice[lo + L ÷ blockDim().x * blockDim().x ÷ 2]# bitonic_median(slice, swap, lo, L, L ÷ blockDim().x, lt, by)
 
     # step 2: use pivot to partition into batches
     call_batch_partition(slice, pivot, swap, b_sums, lo, hi, parity, sync, lt, by)
@@ -469,7 +461,7 @@ function quicksort!(c::AbstractArray{T,N}; lt::F1, by::F2, dims::Int, partial_k=
     get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
     config = launch_configuration(kernel.fun, shmem=threads->get_shmem(threads))
     threads = prevpow(2, config.threads)
-
+    @info "sort regs $(CUDA.registers(kernel))"
     kernel(my_sort_args...;
            blocks=prod(otherdims), threads=threads, shmem=get_shmem(threads))
 
