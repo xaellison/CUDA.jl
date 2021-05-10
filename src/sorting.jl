@@ -382,9 +382,9 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
 
     # step 1: single block sort. It'll either finish sorting a subproblem or
     # help select a pivot value
-    #bubble_sort(slice, swap, lo, L, L < blockDim().x ? 1 : L ÷ blockDim().x, lt, by)
+    bubble_sort(slice, swap, lo, L, L < blockDim().x ? 1 : L ÷ blockDim().x, lt, by)
     if L <= blockDim().x
-        bubble_sort(slice, swap, lo, L, 1, lt, by)
+    #    bubble_sort(slice, swap, lo, L, 1, lt, by)
         return
     end
 
