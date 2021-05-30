@@ -45,18 +45,10 @@ for dim in (:x, :y, :z)
     intr = Symbol("tid.$dim")
     @eval @inline $fn() = Int(_index($(Val(intr)), $(Val(0:max_block_size[dim]-1)))) + 1
 
-    fn = Symbol("threadIdx32_$dim")
-    intr = Symbol("tid.$dim")
-    @eval @inline $fn() = _index($(Val(intr)), $(Val(0:max_block_size[dim]-1))) + 1
-
     # Block size (#threads per block)
     fn = Symbol("blockDim_$dim")
     intr = Symbol("ntid.$dim")
     @eval @inline $fn() = Int(_index($(Val(intr)), $(Val(1:max_block_size[dim]))))
-
-    fn = Symbol("blockDim32_$dim")
-    intr = Symbol("ntid.$dim")
-    @eval @inline $fn() = _index($(Val(intr)), $(Val(1:max_block_size[dim])))
 
     # Block index
     fn = Symbol("blockIdx_$dim")
@@ -96,15 +88,6 @@ Returns the dimensions of the block.
 Returns the thread index within the block.
 """
 @inline threadIdx() = (x=threadIdx_x(), y=threadIdx_y(), z=threadIdx_z())
-
-"""
-sketchy
-"""
-@inline threadIdx(::Type{Int}) = (x=threadIdx_x(), y=threadIdx_y(), z=threadIdx_z())
-@inline blockDim(::Type{Int}) = (x=blockDim_x(), y=blockDim_y(), z=blockDim_z())
-
-@inline threadIdx(::Type{Int32}) = (x=threadIdx32_x(), y=threadIdx32_y(), z=threadIdx32_z())
-@inline blockDim(::Type{Int32}) = (x=blockDim32_x(), y=blockDim32_y(), z=blockDim32_z())
 
 """
     warpsize()::UInt32
