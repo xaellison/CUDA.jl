@@ -407,11 +407,11 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
         if stuck < 2 && partition > lo && partial_range_overlap(lo, partition, partial)
             s = CuDeviceStream()
             if S && sync_depth > 1
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
+                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem, #maxregs=60,
                       qsort_kernel(slice, lo, partition, !parity, Val(true), sync_depth - 1,
                       pivot, lt, by, Val(1), partial, stuck))
             else
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
+                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,# maxregs=60,
                       qsort_kernel(slice, lo, partition, !parity, Val(false), sync_depth - 1,
                       pivot, lt, by, Val(1), partial, stuck))
             end
@@ -421,11 +421,11 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
         if stuck < 2 && partition < hi && partial_range_overlap(partition, hi, partial)
             s = CuDeviceStream()
             if S && sync_depth > 1
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
+                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,# maxregs=60,
                       qsort_kernel(slice, partition, hi, !parity, Val(true), sync_depth - 1,
                       pivot, lt, by, Val(1), partial, stuck))
             else
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
+                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,# maxregs=60,
                       qsort_kernel(slice, partition, hi, !parity, Val(false), sync_depth - 1,
                       pivot, lt, by, Val(1), partial, stuck))
             end
@@ -456,14 +456,14 @@ function quicksort!(c::AbstractArray{T,N}; lt::F1, by::F2, dims::Int, partial_k=
     my_sort_args = sort_args((c, 0, len, true, Val(N==1 && max_depth > 1),
              max_depth, nothing, lt, by, Val(dims)), partial_k)
 
-    kernel = @cuda launch=false qsort_kernel(my_sort_args...)
+    kernel = @cuda launch=false maxregs=60 qsort_kernel(my_sort_args...)
 
     get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
     config = launch_configuration(kernel.fun, shmem=threads->get_shmem(threads))
     threads = prevpow(2, config.threads)
     @info "sort regs $(CUDA.registers(kernel))"
     kernel(my_sort_args...;
-           blocks=prod(otherdims), threads=threads, shmem=get_shmem(threads))
+           blocks=prod(otherdims), threads=threads, shmem=get_shmem(threads), maxregs=60)
 
     return c
 end
