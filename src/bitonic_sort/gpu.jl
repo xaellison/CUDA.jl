@@ -50,7 +50,7 @@ function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
 end
 
 function kernel(c, depth1, depth2)
-    index =  threadIdx().x - 1
+    index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
     if index >= length(c)
         return
     end
@@ -76,7 +76,7 @@ function bitosort(c)
 
         for log_j in 1:(1+log_k0-log_k)
             #println((log_k, log_j))
-            @cuda blocks=cld(length(c), 128) threads=128 kernel(c, log_k, log_j )
+            @cuda blocks=cld(length(c), 256) threads=256 kernel(c, log_k, log_j )
             #
         end
 
