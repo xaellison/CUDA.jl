@@ -86,43 +86,37 @@ end
 
 
 # can handle non-pow2 within a range < blocksize
-function kernel_small(c :: AbstractArray{T}, depth1, depth2) where T
+
+function kernel_small(c :: AbstractArray{T}) where T
     swap = @cuDynamicSharedMem(T, blockDim().x)
     if threadIdx().x <= length(c)
         swap[threadIdx().x] = c[threadIdx().x]
     end
     log_k0 = c |> length |> log2 |> ceil |> Int
-
+    index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
     for log_k in log_k0:-1:1
-
+        LO, N, dir = get_range_part1(length(c), index, log_k)
         for log_j in 1:(1+log_k0-log_k)
-            index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
             do_swap = true
             if index >= length(c)
                 do_swap = false
             end
-            lo = n = -1
-            dir = false
-            if do_swap
-                lo, n, dir = get_range(length(c), index, log_k, log_j)
-                if lo < 0 || n < 0
-                    do_swap = false
-                end
+
+            lo, n = get_range_part2(LO, N, index, log_j)
+            if lo < 0 || n < 0
+                do_swap = false
             end
             m = gp2lt(n)
+
             sync_threads()
-            if  lo <= index < lo + n - m && do_swap
-                i, j = index, index + m
-                if j < lo + n
-                    compare(swap, i, j, dir)
-                end
+            if  do_swap && lo <= index < lo + n - m
+                compare(swap, index, index + m, dir)
             end
-            sync_threads()
         end
 
     end
     sync_threads()
-    if threadIdx().x <= length(c)
+    if threadIdx().x <= length(c) && blockIdx().x == 1
         c[threadIdx().x] = swap[threadIdx().x]
     end
 
