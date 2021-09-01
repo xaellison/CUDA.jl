@@ -11,12 +11,11 @@ function gp2lt(n)
     out
 end
 
-exchange(A, i, j) = begin A[i + 1], A[j + 1] = A[j + 1], A[i + 1] end
+@inline exchange(A, i, j) = begin A[i + 1], A[j + 1] = A[j + 1], A[i + 1] end
 
-compare(A, i, j, dir :: Bool) = if dir == (A[i + 1] > A[j + 1]) exchange(A, i, j) end
+@inline compare(A, i, j, dir :: Bool) = if dir == (A[i + 1] > A[j + 1]) exchange(A, i, j) end
 
-
-function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
+@inline function get_range_part1(L, index, depth1) :: Tuple{Int, Int, Bool}
     lo = 0
     dir = true
     for iter in 1:depth1-1
@@ -32,20 +31,36 @@ function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
             L = L - L ÷ 2
         end
     end
+    return lo, L, dir
+end
+
+@inline function evolver(index, L, lo)
+    if L <= 1
+        return -1, -1
+    end
+    m = gp2lt(L)
+    if index < lo + m
+        L = m
+    else
+        lo = lo + m
+        L = L - m
+    end
+    return lo, L
+end
+
+@inline function get_range_part2(lo, L, index, depth2) :: Tuple{Int, Int}
 
     for iter in 1:depth2-1
-        if L <= 1
-            return -1, -1, false
-        end
-        m = gp2lt(L)
-        if index < lo + m
-            L = m
-        else
-            lo = lo + m
-            L = L - m
-        end
+        lo, L = evolver(index, L, lo)
     end
 
+    return lo, L
+end
+
+
+function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
+    lo, L, dir = get_range_part1(L, index, depth1)
+    lo, L = get_range_part2(lo, L, index, depth2)
     return lo, L, dir
 end
 
@@ -62,7 +77,28 @@ function kernel(c, depth1, depth2)
     m = gp2lt(n)
     if  lo <= index < lo + n - m
         i, j = index, index + m
-        compare(c, i, j, dir)
+        @inbounds compare(c, i, j, dir)
+    end
+
+    return
+end
+
+function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f) where T
+    index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
+    lo, n, dir = get_range_part1(length(c), index, depth1)
+    lo, n = get_range_part2(lo, n, index, d2_0)
+    for depth2 in d2_0:d2_f
+
+        if index < length(c) && lo >= 0
+            #lo, n, dir = get_range(length(c), index, depth1, depth2)
+            m = gp2lt(n)
+            if  lo <= index < lo + n - m
+                i, j = index, index + m
+                @inbounds compare(c, i, j, dir)
+            end
+        end
+        sync_threads()
+        lo, n = evolver(index, n, lo)
     end
 
     return
@@ -72,53 +108,27 @@ end
 function bitosort(c)
     log_k0 = c |> length |> log2 |> ceil |> Int
 
+    block_size = 1024
+    log_block = block_size |> log2 |> Int
+
     for log_k in log_k0:-1:1
 
-        for log_j in 1:(1+log_k0-log_k)
-            #println((log_k, log_j))
-            @cuda blocks=cld(length(c), 256) threads=256 kernel(c, log_k, log_j )
-            #
+        j_final = (1+log_k0-log_k)
+        for log_j in 1:j_final
+        #    @info "$log_k $log_j"
+            if log_k0 - log_k - log_j + 2 <= log_block
+                # kernel loops
+            #    @info "smol"
+                @cuda blocks=cld(length(c), block_size) threads=block_size shmem=sizeof(eltype(c))*block_size kernel_small(c, log_k, log_j, j_final)
+                break
+            else
+                #@info "big $(1+log_k0-log_k) $log_j $(1+log_k0-log_k+log_j)"
+                @cuda blocks=cld(length(c), block_size) threads=block_size kernel(c, log_k, log_j)
+            end
+
+
         end
 
     end
     synchronize()
-end
-
-
-# can handle non-pow2 within a range < blocksize
-
-function kernel_small(c :: AbstractArray{T}) where T
-    swap = @cuDynamicSharedMem(T, blockDim().x)
-    if threadIdx().x <= length(c)
-        swap[threadIdx().x] = c[threadIdx().x]
-    end
-    log_k0 = c |> length |> log2 |> ceil |> Int
-    index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
-    for log_k in log_k0:-1:1
-        LO, N, dir = get_range_part1(length(c), index, log_k)
-        for log_j in 1:(1+log_k0-log_k)
-            do_swap = true
-            if index >= length(c)
-                do_swap = false
-            end
-
-            lo, n = get_range_part2(LO, N, index, log_j)
-            if lo < 0 || n < 0
-                do_swap = false
-            end
-            m = gp2lt(n)
-
-            sync_threads()
-            if  do_swap && lo <= index < lo + n - m
-                compare(swap, index, index + m, dir)
-            end
-        end
-
-    end
-    sync_threads()
-    if threadIdx().x <= length(c) && blockIdx().x == 1
-        c[threadIdx().x] = swap[threadIdx().x]
-    end
-
-    return
 end
