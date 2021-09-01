@@ -69,7 +69,9 @@ function kernel(c, depth1, depth2)
     if index >= length(c)
         return
     end
+
     lo, n, dir = get_range(length(c), index, depth1, depth2)
+
     if lo < 0 || n < 0
         return
     end
@@ -90,7 +92,6 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f) where T
     for depth2 in d2_0:d2_f
 
         if index < length(c) && lo >= 0
-            #lo, n, dir = get_range(length(c), index, depth1, depth2)
             m = gp2lt(n)
             if  lo <= index < lo + n - m
                 i, j = index, index + m
@@ -115,17 +116,12 @@ function bitosort(c)
 
         j_final = (1+log_k0-log_k)
         for log_j in 1:j_final
-        #    @info "$log_k $log_j"
             if log_k0 - log_k - log_j + 2 <= log_block
-                # kernel loops
-            #    @info "smol"
-                @cuda blocks=cld(length(c), block_size) threads=block_size shmem=sizeof(eltype(c))*block_size kernel_small(c, log_k, log_j, j_final)
+                @cuda blocks=cld(length(c), block_size) threads=block_size kernel_small(c, log_k, log_j, j_final)
                 break
             else
-                #@info "big $(1+log_k0-log_k) $log_j $(1+log_k0-log_k+log_j)"
                 @cuda blocks=cld(length(c), block_size) threads=block_size kernel(c, log_k, log_j)
             end
-
 
         end
 
