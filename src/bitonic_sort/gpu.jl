@@ -1,6 +1,7 @@
 using CUDA
-"""
+
 @inline function gp2lt(x :: Int)
+   x -= 1
    x |= x >> 1
    x |= x >> 2
    x |= x >> 4
@@ -8,18 +9,6 @@ using CUDA
    x |= x >> 16
    x |= x >> 32
    xor(x, x >> 1)
-end
-"""
-
-function gp2lt(n)
-    if n <= 1
-        return 0
-    end
-    out = 1
-    while out * 2 < n
-        out *= 2
-    end
-    out
 end
 
 gp2gt(n) = if n <= 1 0 else Int(2^ceil(log2(n))) end
@@ -140,14 +129,8 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, debug) where T
     grid_index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
 
     index = _lo + threadIdx().x - 1
-    if threadIdx().x <= _n && index <= length(debug)
-    #    debug[grid_index] = index #(_lo, _n, dir)
-    end
     lo, n = _lo, _n
-
     for depth2 in d2_0:d2_f
-        lo, n, dir = get_range(length(c), index, depth1, depth2)
-
         if ! (lo < 0 || n < 0) && !(index >= length(c)) && threadIdx().x <= _n && _lo >= 0
 
             m = gp2lt(n)
@@ -156,7 +139,7 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, debug) where T
                 @inbounds compare(c, i, j, dir)
             end
         end
-
+        lo, n = evolver(index, n, lo)
         sync_threads()
     end
 
@@ -167,7 +150,6 @@ end
 function bitosort(c, block_size=1024)
     log_k0 = c |> length |> log2 |> ceil |> Int
     debug = CuArray(zeros(Int, length(c)))
-    @info block_size
     log_block = block_size |> log2 |> Int
 
     for log_k in log_k0:-1:1
@@ -179,16 +161,8 @@ function bitosort(c, block_size=1024)
 
                 _block_size = 1 << abs(j_final + 1 - log_j)
                 b= gp2gt(cld(length(c), _block_size))
-                @info "smol $log_k, $log_j, $j_final. blocks = $b"
                 @cuda blocks=b threads=_block_size kernel_small(c, log_k, log_j, j_final, debug)
-                synchronize()
 
-                #println(debug)
-
-                println(length(filter(x->x!=0, Array(debug))))
-                println(length(Set(Array(debug))))
-                println()
-                #return
                 break
             else
                 @cuda blocks=cld(length(c), block_size) threads=block_size kernel(c, log_k, log_j)
