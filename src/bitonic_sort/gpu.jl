@@ -15,7 +15,7 @@ gp2gt(n) = if n <= 1 0 else Int(2^ceil(log2(n))) end
 
 @inline exchange(A, i, j) = begin A[i + 1], A[j + 1] = A[j + 1], A[i + 1] end
 
-@inline compare(A, i, j, dir :: Bool, by, lt) = if dir == lt(by(A[i + 1]) > by(A[j + 1])) exchange(A, i, j) end
+@inline compare(A, i, j, dir :: Bool, by, lt) = if dir != lt(by(A[i + 1]) , by(A[j + 1])) exchange(A, i, j) end
 
 @inline function get_range_part1(L, index, depth1) :: Tuple{Int, Int, Bool}
     lo = 0
@@ -169,12 +169,12 @@ function bitosort(c, block_size=1024; by=identity, lt=isless)
 
                 _block_size = 1 << abs(j_final + 1 - log_j)
                 b = max(1, gp2gt(cld(length(c), _block_size)))
-                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, log_k, log_j, j_final)
+                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, log_k, log_j, j_final, by, lt)
 
                 break
             else
                 b = max(1, cld(length(c), block_size) )
-                @cuda blocks=b threads=block_size kernel(c, log_k, log_j)
+                @cuda blocks=b threads=block_size kernel(c, log_k, log_j, by, lt)
             end
 
         end
