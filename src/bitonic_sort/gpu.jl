@@ -15,7 +15,7 @@ gp2gt(n) = if n <= 1 0 else Int(2^ceil(log2(n))) end
 
 @inline exchange(A, i, j) = begin A[i + 1], A[j + 1] = A[j + 1], A[i + 1] end
 
-@inline compare(A, i, j, dir :: Bool) = if dir == (A[i + 1] > A[j + 1]) exchange(A, i, j) end
+@inline compare(A, i, j, dir :: Bool, by, lt) = if dir == lt(by(A[i + 1]) > by(A[j + 1])) exchange(A, i, j) end
 
 @inline function get_range_part1(L, index, depth1) :: Tuple{Int, Int, Bool}
     lo = 0
@@ -66,7 +66,7 @@ function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
     return lo, L, dir
 end
 
-function kernel(c, depth1, depth2)
+function kernel(c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
     index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
 
     lo, n, dir = get_range(length(c), index, depth1, depth2)
@@ -76,7 +76,7 @@ function kernel(c, depth1, depth2)
         m = gp2lt(n)
         if  lo <= index < lo + n - m
             i, j = index, index + m
-            @inbounds compare(c, i, j, dir)
+            @inbounds compare(c, i, j, dir, by, lt)
         end
     end
     return
@@ -124,7 +124,7 @@ function blockit(L, index, depth1, depth2)
     return lo, L, dir
 end
 
-function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f) where T
+function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, by::F1, lt::F2) where {T,F1,F2}
     swap = @cuDynamicSharedMem(T, blockDim().x)
     _lo, _n, dir = blockit(length(c), blockIdx().x -1, depth1, d2_0)
     index = _lo + threadIdx().x - 1
@@ -138,12 +138,12 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f) where T
     lo, n = _lo, _n
 
     for depth2 in d2_0:d2_f
-        if ! (lo < 0 || n < 0) && !(index >= length(c)) && in_range
+        if ! (lo < 0 || n < 0) && in_range
 
             m = gp2lt(n)
             if  lo <= index < lo + n - m
                 i, j = index - _lo, index - _lo + m
-                @inbounds compare(swap, i, j, dir)
+                @inbounds compare(swap, i, j, dir, by, lt)
             end
         end
         lo, n = evolver(index, n, lo)
@@ -156,7 +156,7 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f) where T
 end
 
 
-function bitosort(c, block_size=1024)
+function bitosort(c, block_size=1024; by=identity, lt=isless)
     log_k0 = c |> length |> log2 |> ceil |> Int
     log_block = block_size |> log2 |> Int
 
@@ -168,12 +168,13 @@ function bitosort(c, block_size=1024)
             if log_k0 - log_k - log_j + 2 <= log_block
 
                 _block_size = 1 << abs(j_final + 1 - log_j)
-                b = gp2gt(cld(length(c), _block_size))
+                b = max(1, gp2gt(cld(length(c), _block_size)))
                 @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, log_k, log_j, j_final)
 
                 break
             else
-                @cuda blocks=cld(length(c), block_size) threads=block_size kernel(c, log_k, log_j)
+                b = max(1, cld(length(c), block_size) )
+                @cuda blocks=b threads=block_size kernel(c, log_k, log_j)
             end
 
         end
