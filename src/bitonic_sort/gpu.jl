@@ -124,32 +124,40 @@ function blockit(L, index, depth1, depth2)
     return lo, L, dir
 end
 
-function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, debug) where T
+function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f) where T
+    swap = @cuDynamicSharedMem(T, blockDim().x)
     _lo, _n, dir = blockit(length(c), blockIdx().x -1, depth1, d2_0)
-    grid_index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-
     index = _lo + threadIdx().x - 1
+
+    in_range = threadIdx().x <= _n && _lo >= 0
+
+    if in_range
+        swap[threadIdx().x] = c[index + 1]
+    end
+    sync_threads()
     lo, n = _lo, _n
+
     for depth2 in d2_0:d2_f
-        if ! (lo < 0 || n < 0) && !(index >= length(c)) && threadIdx().x <= _n && _lo >= 0
+        if ! (lo < 0 || n < 0) && !(index >= length(c)) && in_range
 
             m = gp2lt(n)
             if  lo <= index < lo + n - m
-                i, j = index, index + m
-                @inbounds compare(c, i, j, dir)
+                i, j = index - _lo, index - _lo + m
+                @inbounds compare(swap, i, j, dir)
             end
         end
         lo, n = evolver(index, n, lo)
         sync_threads()
     end
-
+    if in_range
+        c[index + 1] = swap[threadIdx().x]
+    end
     return
 end
 
 
 function bitosort(c, block_size=1024)
     log_k0 = c |> length |> log2 |> ceil |> Int
-    debug = CuArray(zeros(Int, length(c)))
     log_block = block_size |> log2 |> Int
 
     for log_k in log_k0:-1:1
@@ -157,11 +165,11 @@ function bitosort(c, block_size=1024)
         j_final = (1+log_k0-log_k)
 
         for log_j in 1:j_final
-            if log_k0 - log_k - log_j + 2 < log_block
+            if log_k0 - log_k - log_j + 2 <= log_block
 
                 _block_size = 1 << abs(j_final + 1 - log_j)
-                b= gp2gt(cld(length(c), _block_size))
-                @cuda blocks=b threads=_block_size kernel_small(c, log_k, log_j, j_final, debug)
+                b = gp2gt(cld(length(c), _block_size))
+                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, log_k, log_j, j_final)
 
                 break
             else
@@ -171,5 +179,4 @@ function bitosort(c, block_size=1024)
         end
 
     end
-    synchronize()
 end
