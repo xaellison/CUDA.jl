@@ -71,7 +71,7 @@ function kernel(c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
 
     lo, n, dir = get_range(length(c), index, depth1, depth2)
 
-    if ! (lo < 0 || n < 0) && !(index >= length(c))
+    if lo <= index <= lo + n
 
         m = gp2lt(n)
         if  lo <= index < lo + n - m
@@ -125,12 +125,17 @@ function blockit(L, index, depth1, depth2)
 end
 
 function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, by::F1, lt::F2) where {T,F1,F2}
-    swap = @cuDynamicSharedMem(T, blockDim().x)
-    _lo, _n, dir = blockit(length(c), blockIdx().x -1, depth1, d2_0)
+    block_swap = @cuDynamicSharedMem(T, (blockDim().x, blockDim().y))
+    virtual_block = (blockIdx().x - 1) * blockDim().y + threadIdx().y - 1
+    #virtual_block = (threadIdx().y - 1) * (gridDim().x ) + blockIdx().x - 1
+    _lo, _n, dir = blockit(length(c), virtual_block, depth1, d2_0)
     index = _lo + threadIdx().x - 1
 
-    in_range = threadIdx().x <= _n && _lo >= 0
+    in_range = _lo <= index < _lo + _n && index < length(c)
 
+    swap = view(block_swap, :, threadIdx().y)
+
+    sync_threads()
     if in_range
         swap[threadIdx().x] = c[index + 1]
     end
@@ -143,7 +148,7 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, by::F1, lt::F2)
             m = gp2lt(n)
             if  lo <= index < lo + n - m
                 i, j = index - _lo, index - _lo + m
-                @inbounds compare(swap, i, j, dir, by, lt)
+                compare(swap, i, j, dir, by, lt)
             end
         end
         lo, n = evolver(index, n, lo)
@@ -168,8 +173,18 @@ function bitosort(c, block_size=1024; by=identity, lt=isless)
             if log_k0 - log_k - log_j + 2 <= log_block
 
                 _block_size = 1 << abs(j_final + 1 - log_j)
+
                 b = max(1, gp2gt(cld(length(c), _block_size)))
-                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, log_k, log_j, j_final, by, lt)
+                W = warpsize(device())
+                if _block_size < W
+                    b = b ÷ (W ÷ _block_size)
+                    _block_size = (_block_size, W ÷ _block_size)
+                else
+                    _block_size = (_block_size, 1)
+                end
+
+                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*prod(_block_size) kernel_small(c, log_k, log_j, j_final, by, lt)
+                synchronize()
 
                 break
             else
