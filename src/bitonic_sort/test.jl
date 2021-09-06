@@ -58,7 +58,7 @@ end
         log_k0 = a |> length |> log2 |> ceil |> Int
         for log_k in log_k0:-1:1
 
-            j_final = (1+log_k0-log_k)
+            j_final = (1 + log_k0 - log_k)
 
             for log_j in 1:j_final
                 push!(expected_loops, (log_k, log_j))
