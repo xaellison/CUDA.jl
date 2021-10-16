@@ -13,9 +13,23 @@ end
 
 gp2gt(n) = if n <= 1 0 else Int(2^ceil(log2(n))) end
 
-@inline exchange(A, i, j) = begin A[i + 1], A[j + 1] = A[j + 1], A[i + 1] end
+function exchange(A :: AbstractArray{T}, i, j) where T
+    @inbounds A[i + 1], A[j + 1] = A[j + 1], A[i + 1]
+end
 
-@inline compare(A, i, j, dir :: Bool, by, lt) = if dir != lt(by(A[i + 1]) , by(A[j + 1])) exchange(A, i, j) end
+function compare(A :: AbstractArray{T}, i, j, dir :: Bool, by, lt) where T
+    @inbounds if dir != lt(by(A[i + 1]) , by(A[j + 1]))
+        exchange(A, i, j)
+    end
+end
+
+@inline function compare(A_I :: Tuple{AbstractArray{T}, AbstractArray{Int}}, i, j, dir :: Bool, by, lt) where T
+    A, i_A = A_I
+    @inbounds if dir != lt(by(A[i + 1]) , by(A[j + 1]))
+        exchange(A, i, j)
+        exchange(i_A, i, j)
+    end
+end
 
 @inline function get_range_part1(L, index, depth1) :: Tuple{Int, Int, Bool}
     lo = 0
@@ -66,12 +80,12 @@ function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
     return lo, L, dir
 end
 
-function kernel(c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
+function kernel(c, length_c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
     index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
 
-    lo, n, dir = get_range(length(c), index, depth1, depth2)
+    lo, n, dir = get_range(length_c, index, depth1, depth2)
 
-    if ! (lo < 0 || n < 0) && !(index >= length(c))
+    if ! (lo < 0 || n < 0) && !(index >= length_c)
 
         m = gp2lt(n)
         if  lo <= index < lo + n - m
@@ -124,17 +138,51 @@ function blockit(L, index, depth1, depth2)
     return lo, L, dir
 end
 
-function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, by::F1, lt::F2) where {T,F1,F2}
-    swap = @cuDynamicSharedMem(T, blockDim().x)
-    _lo, _n, dir = blockit(length(c), blockIdx().x -1, depth1, d2_0)
-    index = _lo + threadIdx().x - 1
 
-    in_range = threadIdx().x <= _n && _lo >= 0
-
+function initialize_shmem(c :: AbstractArray{T}, index, in_range, offset=0) where T
+    swap = @cuDynamicSharedMem(T, blockDim().x, offset)
     if in_range
         swap[threadIdx().x] = c[index + 1]
     end
     sync_threads()
+    return swap
+end
+
+function initialize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}}, index, in_range) where T
+    swap_vals = initialize_shmem(c[1], index, in_range)
+    swap_indices = initialize_shmem(c[2], index, in_range, sizeof(swap_vals))
+    sync_threads()
+    return swap_vals, swap_indices
+end
+
+function finalize_shmem(c :: AbstractArray{T},
+                        swap :: AbstractArray{T},
+                        index,
+                        in_range) where T
+    if in_range
+        c[index + 1] = swap[threadIdx().x]
+    end
+end
+
+function finalize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}},
+                        swap :: Tuple{AbstractArray{T}, AbstractArray{Int}},
+                        index,
+                        in_range) where T
+    if in_range
+        c[1][index + 1] = swap[1][threadIdx().x]
+        c[2][index + 1] = swap[2][threadIdx().x]
+    end
+end
+
+function kernel_small(c :: Union{AbstractArray{T}, Tuple{AbstractArray{T}, AbstractArray{Int}}},
+                      length_c, depth1, d2_0, d2_f, by::F1, lt::F2) where {T,F1,F2}
+
+    _lo, _n, dir = blockit(length_c, blockIdx().x -1, depth1, d2_0)
+    index = _lo + threadIdx().x - 1
+
+    in_range = threadIdx().x <= _n && _lo >= 0
+    swap = initialize_shmem(c, index, in_range)
+
     lo, n = _lo, _n
 
     for depth2 in d2_0:d2_f
@@ -143,20 +191,19 @@ function kernel_small(c :: AbstractArray{T}, depth1, d2_0, d2_f, by::F1, lt::F2)
             m = gp2lt(n)
             if  lo <= index < lo + n - m
                 i, j = index - _lo, index - _lo + m
-                @inbounds compare(swap, i, j, dir, by, lt)
+                compare(swap, i, j, dir, by, lt)
             end
         end
         lo, n = evolver(index, n, lo)
         sync_threads()
     end
-    if in_range
-        c[index + 1] = swap[threadIdx().x]
-    end
+
+    finalize_shmem(c, swap, index, in_range)
     return
 end
 
 
-function bitosort(c, block_size=1024; by=identity, lt=isless)
+function bitosort(c, block_size=1; by=identity, lt=isless)
     log_k0 = c |> length |> log2 |> ceil |> Int
     log_block = block_size |> log2 |> Int
 
@@ -169,15 +216,43 @@ function bitosort(c, block_size=1024; by=identity, lt=isless)
 
                 _block_size = 1 << abs(j_final + 1 - log_j)
                 b = max(1, gp2gt(cld(length(c), _block_size)))
-                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, log_k, log_j, j_final, by, lt)
+                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, length(c), log_k, log_j, j_final, by, lt)
 
                 break
             else
                 b = max(1, cld(length(c), block_size) )
-                @cuda blocks=b threads=block_size kernel(c, log_k, log_j, by, lt)
+                @cuda blocks=b threads=block_size kernel(c, length(c), log_k, log_j, by, lt)
             end
 
         end
 
     end
+end
+
+
+function bsp(c, block_size=1024; by=identity, lt=isless)
+    log_k0 = c |> length |> log2 |> ceil |> Int
+    log_block = block_size |> log2 |> Int
+    I = CuArray(collect(1:length(c)))
+    for log_k in log_k0:-1:1
+
+        j_final = (1+log_k0-log_k)
+
+        for log_j in 1:j_final
+            if log_k0 - log_k - log_j + 2 <= log_block
+                _block_size = 1 << abs(j_final + 1 - log_j)
+                b = max(1, gp2gt(cld(length(c), _block_size)))
+                shmem = (sizeof(Int) + sizeof(eltype(c)))*_block_size
+                @cuda blocks=b threads=_block_size shmem=shmem kernel_small((c, I), length(c), log_k, log_j, j_final, by, lt)
+
+                break
+            else
+                b = max(1, cld(length(c), block_size) )
+                @cuda blocks=b threads=block_size kernel((c, I), length(c), log_k, log_j, by, lt)
+            end
+
+        end
+
+    end
+    I
 end
