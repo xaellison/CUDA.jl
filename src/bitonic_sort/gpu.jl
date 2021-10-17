@@ -35,10 +35,25 @@ function compare(A :: AbstractArray{T}, i, j, dir :: Bool, by, lt) where T
     end
 end
 
-@inline function compare(A_I :: Tuple{AbstractArray{T}, AbstractArray{Int}}, i, j, dir :: Bool, by, lt) where T
+@inline function compare(A_I :: Tuple{AbstractArray{T}, AbstractArray{Int}}, i, j, dir :: Bool, by, lt, exchange_vals :: Val{E} = Val(false)) where {T, E}
     A, i_A = A_I
     @inbounds if dir != lt(by(A[i + 1]) , by(A[j + 1]))
+        if E
+            exchange(A, i, j)
+        end
+        exchange(i_A, i, j)
+    end
+end
+
+@inline function compare_large(A :: AbstractArray{T}, i, j, dir :: Bool, by, lt) where {T}
+    @inbounds if dir != lt(by(A[i + 1]) , by(A[j + 1]))
         exchange(A, i, j)
+    end
+end
+
+@inline function compare_large(A_I :: Tuple{AbstractArray{T}, AbstractArray{Int}}, i, j, dir :: Bool, by, lt) where {T}
+    A, i_A = A_I
+    @inbounds if dir != lt(by(A[i_A[i + 1]]) , by(A[i_A[j + 1]]))
         exchange(i_A, i, j)
     end
 end
@@ -116,7 +131,7 @@ function kernel(c, length_c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
         m = gp2lt(n)
         if  lo <= index < lo + n - m
             i, j = index, index + m
-            @inbounds compare(c, i, j, dir, by, lt)
+            @inbounds compare_large(c, i, j, dir, by, lt)
         end
     end
     return
@@ -183,8 +198,14 @@ function initialize_shmem(c :: AbstractArray{T}, index, in_range, offset=0) wher
 end
 
 function initialize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}}, index, in_range) where T
-    swap_vals = initialize_shmem(c[1], index, in_range)
+    #swap_vals = initialize_shmem(c[1], index, in_range)
+    swap_vals = @cuDynamicSharedMem(T, blockDim().x)
     swap_indices = initialize_shmem(c[2], index, in_range, sizeof(swap_vals))
+    #, offset)
+    if in_range
+        swap_vals[threadIdx().x] = c[1][swap_indices[threadIdx().x]]
+    end
+    sync_threads()
     return swap_vals, swap_indices
 end
 
@@ -198,7 +219,7 @@ function finalize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}},
                         swap :: Tuple{AbstractArray{T}, AbstractArray{Int}},
                         index,
                         in_range) where T
-    finalize_shmem(c[1], swap[1], index, in_range)
+    #finalize_shmem(c[1], swap[1], index, in_range)
     finalize_shmem(c[2], swap[2], index, in_range)
 end
 
@@ -226,7 +247,7 @@ function kernel_small(c :: Union{AbstractArray{T}, Tuple{AbstractArray{T}, Abstr
             m = gp2lt(n)
             if  lo <= index < lo + n - m
                 i, j = index - _lo, index - _lo + m
-                compare(swap, i, j, dir, by, lt)
+                compare(swap, i, j, dir, by, lt, Val(true))
             end
         end
         lo, n = evolver(index, n, lo)
@@ -273,11 +294,10 @@ end
 Basically identical to `bitonic_sort` but passes a tuple of the CuArray of values
 with an Array of indices
 """
-function bsp(c, block_size=1024; by=identity, lt=isless)
+function bsp(I, c, block_size=1024; by=identity, lt=isless)
     log_k0 = c |> length |> log2 |> ceil |> Int
     log_block = block_size |> log2 |> Int
-    I = CuArray(collect(1:length(c)))
-
+    
 
     for log_k in log_k0:-1:1
 
