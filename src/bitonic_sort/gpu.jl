@@ -1,5 +1,17 @@
 using CUDA
 
+"""
+This is an iterative bitonic sort which mimics a recursive version to support
+non-power2 lengths.
+
+Credit for the recursive form of this algorithm goes to:
+https://www.inf.hs-flensburg.de/lang/algorithmen/sortieren/bitonic/oddn.htm
+
+CUDA.jl implementation originally by @xaellison
+"""
+
+# General functions
+
 @inline function gp2lt(x :: Int)
    x -= 1
    x |= x >> 1
@@ -11,7 +23,7 @@ using CUDA
    xor(x, x >> 1)
 end
 
-gp2gt(n) = if n <= 1 0 else Int(2^ceil(log2(n))) end
+gp2gt(n) = if n <= 1 0 else Int(2 ^ ceil(log2(n))) end
 
 function exchange(A :: AbstractArray{T}, i, j) where T
     @inbounds A[i + 1], A[j + 1] = A[j + 1], A[i + 1]
@@ -30,6 +42,10 @@ end
         exchange(i_A, i, j)
     end
 end
+
+
+# Functions specifically for "large" bitonic steps (those that cannot use shmem)
+
 
 @inline function get_range_part1(L, index, depth1) :: Tuple{Int, Int, Bool}
     lo = 0
@@ -80,6 +96,16 @@ function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
     return lo, L, dir
 end
 
+"""
+Performs a step of bitonic sort requiring swaps between indices further apart
+than the size of block allows (eg, 1 <--> 10000)
+
+The grid index directly maps to the index of `c` that will be used in the swap.
+
+Note that to avoid synchronization issues, only one thread from each pair of
+indices being swapped will actually move data. This does mean half of the threads
+do nothing, but it works for non-power2 arrays while allowing direct indexing.
+"""
 function kernel(c, length_c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
     index = (blockDim().x * (blockIdx().x - 1) ) + threadIdx().x - 1
 
@@ -96,7 +122,15 @@ function kernel(c, length_c, depth1, depth2, by::F1, lt::F2) where {F1, F2}
     return
 end
 
-function blockit(L, index, depth1, depth2)
+
+# Functions for "small" bitonic steps (those that can use shmem)
+
+
+"""
+For each thread in the block, "re-compute" the range which would have
+been passed in recursively
+"""
+function block_setup(L, index, depth1, depth2)
 
     lo = 0
     dir = true
@@ -151,14 +185,10 @@ end
 function initialize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}}, index, in_range) where T
     swap_vals = initialize_shmem(c[1], index, in_range)
     swap_indices = initialize_shmem(c[2], index, in_range, sizeof(swap_vals))
-    sync_threads()
     return swap_vals, swap_indices
 end
 
-function finalize_shmem(c :: AbstractArray{T},
-                        swap :: AbstractArray{T},
-                        index,
-                        in_range) where T
+function finalize_shmem(c :: AbstractArray{T}, swap :: AbstractArray{T}, index, in_range) where T
     if in_range
         c[index + 1] = swap[threadIdx().x]
     end
@@ -168,21 +198,26 @@ function finalize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}},
                         swap :: Tuple{AbstractArray{T}, AbstractArray{Int}},
                         index,
                         in_range) where T
-    if in_range
-        c[1][index + 1] = swap[1][threadIdx().x]
-        c[2][index + 1] = swap[2][threadIdx().x]
-    end
+    finalize_shmem(c[1], swap[1], index, in_range)
+    finalize_shmem(c[2], swap[2], index, in_range)
 end
 
+"""
+Performs consecutive steps of bitonic sort requiring swaps between indices no
+further apart than the size of block allows. This effectively moves part of the
+inner loop (over log_j, below) inside of a kernel to minimize launches and do
+swaps in shared mem.
+"""
 function kernel_small(c :: Union{AbstractArray{T}, Tuple{AbstractArray{T}, AbstractArray{Int}}},
                       length_c, depth1, d2_0, d2_f, by::F1, lt::F2) where {T,F1,F2}
 
-    _lo, _n, dir = blockit(length_c, blockIdx().x -1, depth1, d2_0)
+    _lo, _n, dir = block_setup(length_c, blockIdx().x -1, depth1, d2_0)
     index = _lo + threadIdx().x - 1
-
     in_range = threadIdx().x <= _n && _lo >= 0
+
     swap = initialize_shmem(c, index, in_range)
 
+    # mutable copies
     lo, n = _lo, _n
 
     for depth2 in d2_0:d2_f
@@ -203,10 +238,15 @@ function kernel_small(c :: Union{AbstractArray{T}, Tuple{AbstractArray{T}, Abstr
 end
 
 
-function bitosort(c, block_size=1; by=identity, lt=isless)
+# Host side code
+
+
+function bitonic_sort(c, block_size=1024; by=identity, lt=isless)
     log_k0 = c |> length |> log2 |> ceil |> Int
     log_block = block_size |> log2 |> Int
 
+    # These two outer loops are the same as the serial version outlined here:
+    # https://en.wikipedia.org/wiki/Bitonic_sorter#Example_code
     for log_k in log_k0:-1:1
 
         j_final = (1+log_k0-log_k)
@@ -229,11 +269,16 @@ function bitosort(c, block_size=1; by=identity, lt=isless)
     end
 end
 
-
+"""
+Basically identical to `bitonic_sort` but passes a tuple of the CuArray of values
+with an Array of indices
+"""
 function bsp(c, block_size=1024; by=identity, lt=isless)
     log_k0 = c |> length |> log2 |> ceil |> Int
     log_block = block_size |> log2 |> Int
     I = CuArray(collect(1:length(c)))
+
+
     for log_k in log_k0:-1:1
 
         j_final = (1+log_k0-log_k)
@@ -243,6 +288,7 @@ function bsp(c, block_size=1024; by=identity, lt=isless)
                 _block_size = 1 << abs(j_final + 1 - log_j)
                 b = max(1, gp2gt(cld(length(c), _block_size)))
                 shmem = (sizeof(Int) + sizeof(eltype(c)))*_block_size
+
                 @cuda blocks=b threads=_block_size shmem=shmem kernel_small((c, I), length(c), log_k, log_j, j_final, by, lt)
 
                 break
