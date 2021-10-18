@@ -25,22 +25,20 @@ end
 
 gp2gt(n) = if n <= 1 0 else Int(2 ^ ceil(log2(n))) end
 
-function exchange(A :: AbstractArray{T}, i, j) where T
+@inline function exchange(A :: AbstractArray{T}, i, j) where T
     @inbounds A[i + 1], A[j + 1] = A[j + 1], A[i + 1]
 end
 
-function compare(A :: AbstractArray{T}, i, j, dir :: Bool, by, lt) where T
+@inline function compare(A :: AbstractArray{T}, i, j, dir :: Bool, by, lt) where T
     @inbounds if dir != lt(by(A[i + 1]) , by(A[j + 1]))
         exchange(A, i, j)
     end
 end
 
-@inline function compare(A_I :: Tuple{AbstractArray{T}, AbstractArray{Int}}, i, j, dir :: Bool, by, lt, exchange_vals :: Val{E} = Val(false)) where {T, E}
+@inline function compare(A_I :: Tuple{AbstractArray{T}, AbstractArray{Int}}, i, j, dir :: Bool, by, lt) where {T}
     A, i_A = A_I
     @inbounds if dir != lt(by(A[i + 1]) , by(A[j + 1]))
-        if E
-            exchange(A, i, j)
-        end
+        exchange(A, i, j)
         exchange(i_A, i, j)
     end
 end
@@ -247,7 +245,7 @@ function kernel_small(c :: Union{AbstractArray{T}, Tuple{AbstractArray{T}, Abstr
             m = gp2lt(n)
             if  lo <= index < lo + n - m
                 i, j = index - _lo, index - _lo + m
-                compare(swap, i, j, dir, by, lt, Val(true))
+                compare(swap, i, j, dir, by, lt)
             end
         end
         lo, n = evolver(index, n, lo)
@@ -262,10 +260,9 @@ end
 # Host side code
 
 
-function bitonic_sort(c, block_size=1024; by=identity, lt=isless)
+function bitonic_sort(c :: AbstractArray{T}; by=identity, lt=isless) where T
     log_k0 = c |> length |> log2 |> ceil |> Int
-    log_block = block_size |> log2 |> Int
-
+    
     # These two outer loops are the same as the serial version outlined here:
     # https://en.wikipedia.org/wiki/Bitonic_sorter#Example_code
     for log_k in log_k0:-1:1
@@ -273,16 +270,29 @@ function bitonic_sort(c, block_size=1024; by=identity, lt=isless)
         j_final = (1+log_k0-log_k)
 
         for log_j in 1:j_final
-            if log_k0 - log_k - log_j + 2 <= log_block
 
+            get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
+            args1 = (c, length(c), log_k, log_j, j_final, by, lt)
+            kernel1 = @cuda launch=false kernel_small(args1...)
+            config1 = launch_configuration(kernel1.fun, shmem=threads->get_shmem(threads))
+            threads1 = prevpow(2, config1.threads)
+
+            args2 = (c, length(c), log_k, log_j, by, lt)
+            kernel2 = @cuda launch=false kernel(args2...)
+            config2 = launch_configuration(kernel2.fun, shmem=threads->get_shmem(threads))
+            threads2 = prevpow(2, config2.threads)
+
+            threads = min(threads1, threads2)
+            log_threads = threads |> log2 |> Int
+
+            if log_k0 - log_k - log_j + 2 <= log_threads
                 _block_size = 1 << abs(j_final + 1 - log_j)
-                b = max(1, gp2gt(cld(length(c), _block_size)))
-                @cuda blocks=b threads=_block_size shmem=sizeof(eltype(c))*_block_size kernel_small(c, length(c), log_k, log_j, j_final, by, lt)
-
+                b = nextpow(2, cld(length(c), _block_size))
+                kernel1(args1...; blocks=b, threads=threads, shmem=get_shmem(threads))
                 break
             else
-                b = max(1, cld(length(c), block_size) )
-                @cuda blocks=b threads=block_size kernel(c, length(c), log_k, log_j, by, lt)
+                b = nextpow(2, cld(length(c), threads))
+                kernel2(args2...; blocks=b, threads=threads, shmem=get_shmem(threads))
             end
 
         end
@@ -294,31 +304,40 @@ end
 Basically identical to `bitonic_sort` but passes a tuple of the CuArray of values
 with an Array of indices
 """
-function bsp(I, c, block_size=1024; by=identity, lt=isless)
+function bsp(I, c :: AbstractArray{T}; by=identity, lt=isless) where T
+
     log_k0 = c |> length |> log2 |> ceil |> Int
-    log_block = block_size |> log2 |> Int
-    
 
     for log_k in log_k0:-1:1
 
         j_final = (1+log_k0-log_k)
 
         for log_j in 1:j_final
-            if log_k0 - log_k - log_j + 2 <= log_block
+
+            get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
+            args1 = ((c, I), length(c), log_k, log_j, j_final, by, lt)
+            kernel1 = @cuda launch=false kernel_small(args1...)
+            config1 = launch_configuration(kernel1.fun, shmem=threads->get_shmem(threads))
+            threads1 = prevpow(2, config1.threads)
+
+            args2 = ((c, I), length(c), log_k, log_j, by, lt)
+            kernel2 = @cuda launch=false kernel(args2...)
+            config2 = launch_configuration(kernel2.fun, shmem=threads->get_shmem(threads))
+            threads2 = prevpow(2, config2.threads)
+
+            threads = min(threads1, threads2)
+            log_threads = threads |> log2 |> Int
+
+            if log_k0 - log_k - log_j + 2 <= log_threads
                 _block_size = 1 << abs(j_final + 1 - log_j)
-                b = max(1, gp2gt(cld(length(c), _block_size)))
-                shmem = (sizeof(Int) + sizeof(eltype(c)))*_block_size
-
-                @cuda blocks=b threads=_block_size shmem=shmem kernel_small((c, I), length(c), log_k, log_j, j_final, by, lt)
-
+                b = nextpow(2, cld(length(c), _block_size))
+                kernel1(args1...; blocks=b, threads=threads, shmem=get_shmem(threads))
                 break
             else
-                b = max(1, cld(length(c), block_size) )
-                @cuda blocks=b threads=block_size kernel((c, I), length(c), log_k, log_j, by, lt)
+                b = nextpow(2, cld(length(c), threads))
+                kernel2(args2...; blocks=b, threads=threads, shmem=get_shmem(threads))
             end
-
         end
-
     end
     I
 end
