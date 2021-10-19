@@ -8,6 +8,20 @@ Credit for the recursive form of this algorithm goes to:
 https://www.inf.hs-flensburg.de/lang/algorithmen/sortieren/bitonic/oddn.htm
 
 CUDA.jl implementation originally by @xaellison
+
+Overview: The recursive bitonic sort is like most recursive sorts: it does
+something to a range of values [a_1, a_2, ... a_n] and then operates on
+two subregions [a_1, ... a_n÷2] and [a_n÷2, ... a_n]. To port this to GPU, each
+thread of the grid has to decide which recursive region it belongs in. The
+simpler and more general way is to have each grid thread i responsible for
+swapping c[i] in CuArray c. `kernel` does this but that  requires a kernel
+launch per level of swaps to avoid race conditions.
+
+However, many of these swaps can be bundled into a single kernel if they don't
+need to swap outside the range handled by a block. This is what `kernel_small`
+does. Rather than use each grid index to determine the range, the index of the
+block determines the range that all threads in the block share. Within that
+range consecutive threads operate on consecutive array indices.
 """
 
 # General functions
@@ -22,8 +36,6 @@ CUDA.jl implementation originally by @xaellison
    x |= x >> 32
    xor(x, x >> 1)
 end
-
-gp2gt(n) = if n <= 1 0 else Int(2 ^ ceil(log2(n))) end
 
 @inline function exchange(A :: AbstractArray{T}, i, j) where T
     @inbounds A[i + 1], A[j + 1] = A[j + 1], A[i + 1]
@@ -94,16 +106,17 @@ end
 end
 
 @inline function get_range_part2(lo, L, index, depth2) :: Tuple{Int, Int}
-
     for iter in 1:depth2-1
         lo, L = evolver(index, L, lo)
     end
-
     return lo, L
 end
 
-
-function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
+"""
+Determines parameters for swapping when the grid index directly maps to an
+Array index for swapping
+"""
+@inline function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
     lo, L, dir = get_range_part1(L, index, depth1)
     lo, L = get_range_part2(lo, L, index, depth2)
     return lo, L, dir
@@ -141,17 +154,19 @@ end
 
 """
 For each thread in the block, "re-compute" the range which would have
-been passed in recursively
 """
-function block_setup(L, index, depth1, depth2)
+been passed in recursively. This range only depends on the block, and guarantees
+all threads perform swaps accessible using shmem.
 
+Various negative exit values just for debugging.
+"""
+function block_setup(L, block_index, depth1, depth2)
     lo = 0
     dir = true
-    tmp = index  * 2
+    tmp = block_index * 2
     for iter in 1:(depth1-1)
         tmp ÷= 2
         if L <= 1
-
             return -1, -1, false
         end
 
@@ -185,7 +200,9 @@ function block_setup(L, index, depth1, depth2)
     return lo, L, dir
 end
 
-
+"""
+For sort/sort! `c`, allocate and return shared memory view of `c`
+"""
 function initialize_shmem(c :: AbstractArray{T}, index, in_range, offset=0) where T
     swap = @cuDynamicSharedMem(T, blockDim().x, offset)
     if in_range
@@ -195,11 +212,13 @@ function initialize_shmem(c :: AbstractArray{T}, index, in_range, offset=0) wher
     return swap
 end
 
+"""
+For sortperm/sortperm!, allocate and return shared memory views of `c` and index
+array
+"""
 function initialize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}}, index, in_range) where T
-    #swap_vals = initialize_shmem(c[1], index, in_range)
     swap_vals = @cuDynamicSharedMem(T, blockDim().x)
     swap_indices = initialize_shmem(c[2], index, in_range, sizeof(swap_vals))
-    #, offset)
     if in_range
         swap_vals[threadIdx().x] = c[1][swap_indices[threadIdx().x]]
     end
@@ -207,17 +226,22 @@ function initialize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}}, inde
     return swap_vals, swap_indices
 end
 
+"""
+For sort/sort!, copy shmem array `swap` back into global array `c`
+"""
 function finalize_shmem(c :: AbstractArray{T}, swap :: AbstractArray{T}, index, in_range) where T
     if in_range
         c[index + 1] = swap[threadIdx().x]
     end
 end
 
+"""
+For sortperm/sortperm!, copy shmem array `swap` back to global index array
+"""
 function finalize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}},
                         swap :: Tuple{AbstractArray{T}, AbstractArray{Int}},
                         index,
                         in_range) where T
-    #finalize_shmem(c[1], swap[1], index, in_range)
     finalize_shmem(c[2], swap[2], index, in_range)
 end
 
@@ -260,9 +284,9 @@ end
 # Host side code
 
 
-function bitonic_sort(c :: AbstractArray{T}; by=identity, lt=isless) where T
+function bitonic_sort!(c :: AbstractArray{T}; by=identity, lt=isless) where T
     log_k0 = c |> length |> log2 |> ceil |> Int
-    
+
     # These two outer loops are the same as the serial version outlined here:
     # https://en.wikipedia.org/wiki/Bitonic_sorter#Example_code
     for log_k in log_k0:-1:1
@@ -284,7 +308,7 @@ function bitonic_sort(c :: AbstractArray{T}; by=identity, lt=isless) where T
 
             threads = min(threads1, threads2)
             log_threads = threads |> log2 |> Int
-
+            
             if log_k0 - log_k - log_j + 2 <= log_threads
                 _block_size = 1 << abs(j_final + 1 - log_j)
                 b = nextpow(2, cld(length(c), _block_size))
@@ -304,7 +328,7 @@ end
 Basically identical to `bitonic_sort` but passes a tuple of the CuArray of values
 with an Array of indices
 """
-function bsp(I, c :: AbstractArray{T}; by=identity, lt=isless) where T
+function bitonic_sortperm!(I, c :: AbstractArray{T}; by=identity, lt=isless) where T
 
     log_k0 = c |> length |> log2 |> ceil |> Int
 
