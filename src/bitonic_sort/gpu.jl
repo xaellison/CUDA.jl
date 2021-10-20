@@ -72,7 +72,7 @@ end
 # Functions specifically for "large" bitonic steps (those that cannot use shmem)
 
 
-@inline function get_range_part1(L, index, depth1) :: Tuple{Int, Int, Bool}
+@inline function get_range_part1(L, index, depth1)
     lo = 0
     dir = true
     for iter in 1:depth1-1
@@ -105,7 +105,7 @@ end
     return lo, L
 end
 
-@inline function get_range_part2(lo, L, index, depth2) :: Tuple{Int, Int}
+@inline function get_range_part2(lo, L, index, depth2)
     for iter in 1:depth2-1
         lo, L = evolver(index, L, lo)
     end
@@ -116,7 +116,7 @@ end
 Determines parameters for swapping when the grid index directly maps to an
 Array index for swapping
 """
-@inline function get_range(L, index , depth1, depth2) :: Tuple{Int, Int, Bool}
+@inline function get_range(L, index , depth1, depth2)
     lo, L, dir = get_range_part1(L, index, depth1)
     lo, L = get_range_part2(lo, L, index, depth2)
     return lo, L, dir
@@ -154,7 +154,7 @@ end
 
 """
 For each thread in the block, "re-compute" the range which would have
-"""
+
 been passed in recursively. This range only depends on the block, and guarantees
 all threads perform swaps accessible using shmem.
 
@@ -204,12 +204,12 @@ end
 For sort/sort! `c`, allocate and return shared memory view of `c`
 """
 function initialize_shmem(c :: AbstractArray{T}, index, in_range, offset=0) where T
-    swap = @cuDynamicSharedMem(T, blockDim().x, offset)
+    swap = CuDynamicSharedArray(T, (blockDim().x, blockDim().y), offset)
     if in_range
-        swap[threadIdx().x] = c[index + 1]
+        @inbounds swap[threadIdx().x, threadIdx().y] = c[index + 1]
     end
     sync_threads()
-    return swap
+    return @view swap[:, threadIdx().y]
 end
 
 """
@@ -217,13 +217,14 @@ For sortperm/sortperm!, allocate and return shared memory views of `c` and index
 array
 """
 function initialize_shmem(c :: Tuple{AbstractArray{T}, AbstractArray{Int}}, index, in_range) where T
-    swap_vals = @cuDynamicSharedMem(T, blockDim().x)
+    swap_vals = CuDynamicSharedArray(T, (blockDim().x, blockDim().y))
     swap_indices = initialize_shmem(c[2], index, in_range, sizeof(swap_vals))
     if in_range
-        swap_vals[threadIdx().x] = c[1][swap_indices[threadIdx().x]]
+        @inbounds swap_vals[threadIdx().x, threadIdx().y] = c[1][swap_indices[threadIdx().x]]
     end
     sync_threads()
-    return swap_vals, swap_indices
+    vals_view = @view swap_vals[:, threadIdx().y]
+    return vals_view, swap_indices
 end
 
 """
@@ -231,7 +232,7 @@ For sort/sort!, copy shmem array `swap` back into global array `c`
 """
 function finalize_shmem(c :: AbstractArray{T}, swap :: AbstractArray{T}, index, in_range) where T
     if in_range
-        c[index + 1] = swap[threadIdx().x]
+        @inbounds c[index + 1] = swap[threadIdx().x]
     end
 end
 
@@ -253,8 +254,8 @@ swaps in shared mem.
 """
 function kernel_small(c :: Union{AbstractArray{T}, Tuple{AbstractArray{T}, AbstractArray{Int}}},
                       length_c, depth1, d2_0, d2_f, by::F1, lt::F2) where {T,F1,F2}
-
-    _lo, _n, dir = block_setup(length_c, blockIdx().x -1, depth1, d2_0)
+    pseudo_block_idx = (blockIdx().x - 1) * blockDim().y + threadIdx().y - 1
+    _lo, _n, dir = block_setup(length_c, pseudo_block_idx, depth1, d2_0)
     index = _lo + threadIdx().x - 1
     in_range = threadIdx().x <= _n && _lo >= 0
 
@@ -295,7 +296,7 @@ function bitonic_sort!(c :: AbstractArray{T}; by=identity, lt=isless) where T
 
         for log_j in 1:j_final
 
-            get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
+            get_shmem(threads) = prod(threads) * (sizeof(Int) + sizeof(T))
             args1 = (c, length(c), log_k, log_j, j_final, by, lt)
             kernel1 = @cuda launch=false kernel_small(args1...)
             config1 = launch_configuration(kernel1.fun, shmem=threads->get_shmem(threads))
@@ -308,15 +309,20 @@ function bitonic_sort!(c :: AbstractArray{T}; by=identity, lt=isless) where T
 
             threads = min(threads1, threads2)
             log_threads = threads |> log2 |> Int
-            
+
             if log_k0 - log_k - log_j + 2 <= log_threads
-                _block_size = 1 << abs(j_final + 1 - log_j)
-                b = nextpow(2, cld(length(c), _block_size))
-                kernel1(args1...; blocks=b, threads=threads, shmem=get_shmem(threads))
+                pseudo_block_size = 1 << abs(j_final + 1 - log_j)
+                _block_size = if pseudo_block_size < 256
+                    (pseudo_block_size, 256 ÷ pseudo_block_size)
+                else
+                    (pseudo_block_size, 1)
+                end
+                b = nextpow(2, cld(length(c), prod(_block_size)))
+                kernel1(args1...; blocks=b, threads=_block_size, shmem=get_shmem(_block_size))
                 break
             else
                 b = nextpow(2, cld(length(c), threads))
-                kernel2(args2...; blocks=b, threads=threads, shmem=get_shmem(threads))
+                kernel2(args2...; blocks=b, threads=threads)
             end
 
         end
@@ -334,11 +340,11 @@ function bitonic_sortperm!(I, c :: AbstractArray{T}; by=identity, lt=isless) whe
 
     for log_k in log_k0:-1:1
 
-        j_final = (1+log_k0-log_k)
+        j_final = (1 + log_k0 - log_k)
 
         for log_j in 1:j_final
 
-            get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
+            get_shmem(threads) = prod(threads) * (sizeof(Int) + sizeof(T))
             args1 = ((c, I), length(c), log_k, log_j, j_final, by, lt)
             kernel1 = @cuda launch=false kernel_small(args1...)
             config1 = launch_configuration(kernel1.fun, shmem=threads->get_shmem(threads))
@@ -353,15 +359,26 @@ function bitonic_sortperm!(I, c :: AbstractArray{T}; by=identity, lt=isless) whe
             log_threads = threads |> log2 |> Int
 
             if log_k0 - log_k - log_j + 2 <= log_threads
-                _block_size = 1 << abs(j_final + 1 - log_j)
-                b = nextpow(2, cld(length(c), _block_size))
-                kernel1(args1...; blocks=b, threads=threads, shmem=get_shmem(threads))
+                pseudo_block_size = 1 << abs(j_final + 1 - log_j)
+                _block_size = if pseudo_block_size < 256
+                    (pseudo_block_size, 256 ÷ pseudo_block_size)
+                else
+                    (pseudo_block_size, 1)
+                end
+                b = nextpow(2, cld(length(c), prod(_block_size)))
+                kernel1(args1...; blocks=b, threads=_block_size, shmem=get_shmem(_block_size))
                 break
             else
                 b = nextpow(2, cld(length(c), threads))
-                kernel2(args2...; blocks=b, threads=threads, shmem=get_shmem(threads))
+                kernel2(args2...; blocks=b, threads=threads)
             end
         end
     end
-    I
+    return I
 end
+
+a = rand(Float32, 100_000)
+c = CuArray(a)
+I = CuArray(collect(1:length(c)))
+bitonic_sortperm!(I, c)
+synchronize()
