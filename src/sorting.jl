@@ -293,10 +293,10 @@ elements spaced by `stride`. Good for sampling pivot values as well as short sor
 end
 
 """
-Launch batch partition kernel and sync
+Launch batch partition kernel in `stream`
 """
-@inline function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
-                                      parity, sync::Val{true}, lt::F1, by::F2) where {T, F1, F2}
+@inline function call_batch_partition(stream, vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
+                                      parity, lt::F1, by::F2) where {T, F1, F2}
     L = hi - lo
     if threadIdx().x == 1
         blocks_y = cld(L, blockDim().x)
@@ -310,27 +310,71 @@ Launch batch partition kernel and sync
         blocks_z, blocks_y = fldmod1(blocks_y, max_blocks_y[])
 
         @cuda(blocks=(1,blocks_y,blocks_z), threads=blockDim().x, dynamic=true,
-              shmem=blockDim().x*(sizeof(Int)+sizeof(T)),
+              stream=stream, shmem=blockDim().x*(sizeof(Int)+sizeof(T)),
               partition_batches_kernel(vals, pivot, lo, hi, parity, lt, by))
-        device_synchronize()
     end
 
     # XXX: this global fence shouldn't be needed, according to the CUDA docs a sync_threads
     #      should be sufficient to propagate the global memory writes from the child grid
     #      to the (single-block) parent. See JuliaGPU/CUDA.jl#955 for more details.
+
+    # TODO: is this still correct now that we use implicit synchronization?
     threadfence()
 end
 
 """
-Partition batches in a loop using a single block
+Assumes block-sized batches of `vals` are paritioned around `pivot` from `lo` to `hi`, 
+then consolidates so `vals` is fully partitioned, and launches left/right kernels for recursion
 """
-@inline function call_batch_partition(vals::AbstractArray{T}, pivot, swap, b_sums, lo, hi,
-                                      parity, sync::Val{false}, lt::F1, by::F2) where {T, F1, F2}
-    while lo <= hi
-        batch_partition(vals, pivot, swap, b_sums, lo, min(hi, lo + blockDim().x), parity, lt, by)
-        lo += blockDim().x
+function consolidate_batches_and_recurse_kernel(vals, pivot, lo, hi, parity, lt, by)
+    b_sums = CuDynamicSharedArray(Int, blockDim().x)
+    # iffy change
+    shmem = sizeof(b_sums) + sizeof(T) * length(b_sums)
+    L = hi - lo
+
+    # extract the dimension that we need to sort (selected from the rest by the block x index)
+    slice = if N == 1
+        vals
+    else
+        # dimensions that are not part of the sort; index them using the block index
+        otherdims = ntuple(i -> i == dims ? 1 : size(vals, i), N)
+        other = CartesianIndices(otherdims)[blockIdx().x]
+
+        # create a view that keeps the sorting dimension but indexes across the others
+        slicedims = map(Base.Slice, axes(vals))
+        idxs = ntuple(i->i==dims ? slicedims[i] : other[i], N)
+        view(vals, idxs...)
     end
+
+    # step 3: consolidate the partitioned batches so that the sublist from [lo, hi) is
+    #         partitioned, and the partition is stored in `partition`. Dispatching on P
+    #         cleaner and faster than an if statement
+
+    partition = consolidate_batch_partition(slice, pivot, lo, L, b_sums, parity, lt, by)
+
+    # step 4: recursion
+    if threadIdx().x == 1
+        stuck = (pivot == prev_pivot && partition == lo || partition == hi) ? stuck + 1 : 0
+
+        if stuck < 2 && partition > lo && partial_range_overlap(lo, partition, partial)
+            s = CuDeviceStream()
+            @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
+                    qsort_kernel(slice, lo, partition, !parity,
+                    pivot, lt, by, Val(1), partial, stuck))
+            CUDA.unsafe_destroy!(s)
+        end
+
+        if stuck < 2 && partition < hi && partial_range_overlap(partition, hi, partial)
+            s = CuDeviceStream()
+            @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
+                    qsort_kernel(slice, partition, hi, !parity,
+                    pivot, lt, by, Val(1), partial, stuck))
+            CUDA.unsafe_destroy!(s)
+        end
+    end
+
 end
+
 
 """
 Quicksort recursion condition
@@ -357,14 +401,6 @@ partition by < or <= with respect to the pivot. `sync_depth` is how many (more) 
 recursion with `qsort_kernel` can be done before reaching `cudaLimitDevRuntimeSyncDepth`.
 From the host, this value must not exceed that limit.
 
-`sync` and enclosed type `S` determine how partition occurs: If `sync` is `true`, the kernel
-partitions batches in a child kernel, synchronizes, and then consolidates the batches. The
-benefit of this kernel is that it distributes the work of partitioning batches across
-multiple SMs. If `sync` is `false`, the kernel partitions without launching any child
-kernels, then has recursive `qsort_kernel` children for left and right partitions.
-`device_synchronize` is never called from this kernel, so there is no practical limit on
-recursion.
-
 To detect the scenario of all values in the region being the same, we have two args:
 `prev_pivot` and `stuck`. If two consecutive partitions have the same pivot and both failed
 to split the region in two, that means all the values are equal. `stuck` is incremented when
@@ -373,7 +409,7 @@ the pivot hasn't changed and partition = `lo` or `hi`. If `stuck` reaches 2, rec
 it's possible that the first pivot will be that value, which could lead to an incorrectly
 early end to recursion if we started `stuck` at 0.
 """
-function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sync_depth,
+function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity,
                       prev_pivot, lt::F1, by::F2, ::Val{dims}, partial=nothing, stuck=-1) where {T, N, S, F1, F2, dims}
     b_sums = CuDynamicSharedArray(Int, blockDim().x)
     swap = CuDynamicSharedArray(T, blockDim().x, sizeof(b_sums))
@@ -394,8 +430,7 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
         view(vals, idxs...)
     end
 
-    # step 1: single block sort. It'll either finish sorting a subproblem or
-    # help select a pivot value
+    # step 1: single block sort: finish sorting a subproblem
 
     if L <= blockDim().x
         bubble_sort(slice, swap, lo, L, 1, lt, by)
@@ -405,45 +440,13 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity, sync::Val{S}, sy
     pivot = bitonic_median(slice, swap, lo, L, L ÷ blockDim().x, lt, by)
 
     # step 2: use pivot to partition into batches
-    call_batch_partition(slice, pivot, swap, b_sums, lo, hi, parity, sync, lt, by)
+    stream = CuDeviceStream()
+    call_batch_partition(stream, slice, pivot, swap, b_sums, lo, hi, parity, lt, by)
 
-    # step 3: consolidate the partitioned batches so that the sublist from [lo, hi) is
-    #         partitioned, and the partition is stored in `partition`. Dispatching on P
-    #         cleaner and faster than an if statement
 
-    partition = consolidate_batch_partition(slice, pivot, lo, L, b_sums, parity, lt, by)
-
-    # step 4: recursion
     if threadIdx().x == 1
-        stuck = (pivot == prev_pivot && partition == lo || partition == hi) ? stuck + 1 : 0
-
-        if stuck < 2 && partition > lo && partial_range_overlap(lo, partition, partial)
-            s = CuDeviceStream()
-            if S && sync_depth > 1
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
-                      qsort_kernel(slice, lo, partition, !parity, Val(true), sync_depth - 1,
-                      pivot, lt, by, Val(1), partial, stuck))
-            else
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
-                      qsort_kernel(slice, lo, partition, !parity, Val(false), sync_depth - 1,
-                      pivot, lt, by, Val(1), partial, stuck))
-            end
-            CUDA.unsafe_destroy!(s)
-        end
-
-        if stuck < 2 && partition < hi && partial_range_overlap(partition, hi, partial)
-            s = CuDeviceStream()
-            if S && sync_depth > 1
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
-                      qsort_kernel(slice, partition, hi, !parity, Val(true), sync_depth - 1,
-                      pivot, lt, by, Val(1), partial, stuck))
-            else
-                @cuda(threads=blockDim().x, dynamic=true, stream=s, shmem=shmem,
-                      qsort_kernel(slice, partition, hi, !parity, Val(false), sync_depth - 1,
-                      pivot, lt, by, Val(1), partial, stuck))
-            end
-            CUDA.unsafe_destroy!(s)
-        end
+        @cuda(threads=blockDim().x, stream=stream, dynamic=true 
+        consolidate_batches_and_recurse_kernel(vals, pivot, lo, hi, parity, lt, by))
     end
 
     return
@@ -472,6 +475,7 @@ function quicksort!(c::AbstractArray{T,N}; lt::F1, by::F2, dims::Int, partial_k=
     my_sort_args = sort_args((c, 0, len, true, Val(N==1 && max_depth > 1),
              max_depth, nothing, lt, by, Val(dims)), partial_k)
 
+    # TODO: also pre-compile consolidation kernel and use minimum block size of the two
     kernel = @cuda launch=false qsort_kernel(my_sort_args...)
 
     get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
