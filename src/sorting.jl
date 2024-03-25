@@ -449,9 +449,6 @@ end
 
 function quicksort!(c::AbstractArray{T,N}; lt::F1, by::F2, dims::Int, partial_k=nothing,
                     block_size_shift=0) where {T,N,F1,F2}
-    # XXX: after JuliaLang/CUDA.jl#2035, which changed the kernel state struct contents,
-    #      the max depth needed to be reduced by 1 to avoid an illegal memory crash...
-    max_depth = CUDA.limit(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH) - 1
     len = size(c, dims)
 
     1 <= dims <= N || throw(ArgumentError("dimension out of range"))
