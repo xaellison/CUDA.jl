@@ -326,7 +326,7 @@ end
 Assumes block-sized batches of `vals` are paritioned around `pivot` from `lo` to `hi`, 
 then consolidates so `vals` is fully partitioned, and launches left/right kernels for recursion
 """
-function consolidate_batches_and_recurse_kernel(vals, pivot, lo, hi, parity, lt, by)
+function consolidate_batches_and_recurse_kernel(vals::AbstractArray{T,N}, pivot, lo, hi, parity, lt, by, partial, prev_pivot) where {T, N}
     b_sums = CuDynamicSharedArray(Int, blockDim().x)
     # iffy change
     shmem = sizeof(b_sums) + sizeof(T) * length(b_sums)
@@ -372,7 +372,7 @@ function consolidate_batches_and_recurse_kernel(vals, pivot, lo, hi, parity, lt,
             CUDA.unsafe_destroy!(s)
         end
     end
-
+    return
 end
 
 
@@ -410,7 +410,7 @@ it's possible that the first pivot will be that value, which could lead to an in
 early end to recursion if we started `stuck` at 0.
 """
 function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity,
-                      prev_pivot, lt::F1, by::F2, ::Val{dims}, partial=nothing, stuck=-1) where {T, N, S, F1, F2, dims}
+                      prev_pivot, lt::F1, by::F2, ::Val{dims}, partial=nothing, stuck=-1) where {T, N, F1, F2, dims}
     b_sums = CuDynamicSharedArray(Int, blockDim().x)
     swap = CuDynamicSharedArray(T, blockDim().x, sizeof(b_sums))
     shmem = sizeof(b_sums) + sizeof(swap)
@@ -443,12 +443,11 @@ function qsort_kernel(vals::AbstractArray{T,N}, lo, hi, parity,
     stream = CuDeviceStream()
     call_batch_partition(stream, slice, pivot, swap, b_sums, lo, hi, parity, lt, by)
 
-
     if threadIdx().x == 1
-        @cuda(threads=blockDim().x, stream=stream, dynamic=true 
-        consolidate_batches_and_recurse_kernel(vals, pivot, lo, hi, parity, lt, by))
+        @cuda(threads=blockDim().x, stream=stream, dynamic=true, shmem=sizeof(b_sums),
+        consolidate_batches_and_recurse_kernel(vals, pivot, lo, hi, parity, lt, by, partial, prev_pivot))
     end
-
+    CUDA.unsafe_destroy!(stream)
     return
 end
 
@@ -464,23 +463,19 @@ end
 
 function quicksort!(c::AbstractArray{T,N}; lt::F1, by::F2, dims::Int, partial_k=nothing,
                     block_size_shift=0) where {T,N,F1,F2}
-    # XXX: after JuliaLang/CUDA.jl#2035, which changed the kernel state struct contents,
-    #      the max depth needed to be reduced by 1 to avoid an illegal memory crash...
-    max_depth = CUDA.limit(CUDA.LIMIT_DEV_RUNTIME_SYNC_DEPTH) - 1
     len = size(c, dims)
-
     1 <= dims <= N || throw(ArgumentError("dimension out of range"))
     otherdims = ntuple(i -> i == dims ? 1 : size(c, i), N)
 
-    my_sort_args = sort_args((c, 0, len, true, Val(N==1 && max_depth > 1),
-             max_depth, nothing, lt, by, Val(dims)), partial_k)
+    my_sort_args = sort_args((c, 0, len, true, nothing, lt, by, Val(dims)), partial_k)
 
     # TODO: also pre-compile consolidation kernel and use minimum block size of the two
     kernel = @cuda launch=false qsort_kernel(my_sort_args...)
 
     get_shmem(threads) = threads * (sizeof(Int) + sizeof(T))
     config = launch_configuration(kernel.fun, shmem=threads->get_shmem(threads))
-    threads = prevpow(2, config.threads)
+    threads =  prevpow(2, config.threads)
+    @info CUDA.registers(kernel)
     threads = threads >> block_size_shift   # for testing purposes
 
     kernel(my_sort_args...; blocks=prod(otherdims), threads, shmem=get_shmem(threads))
